@@ -1,0 +1,52 @@
+
+
+CIFRADOR: AES
+Tamaño de la clave hay que elegirlo
+IV (como se va a mezclar el primer bloque) -->
+MODO de cifrado (como se concatenan los bloques cuando se cifran) --> No usar ECB si se va a cifrar más de un bloque. Meter CTR si no se sabe que se hace 
+PADDING --> como va a rellenar el último bloque si no está entero
+
+
+
+NOMBRES DE BUCKETS:
+·Usuarios --> Key:username Value:{contraseña, apellido, id_especialidad, id_hospital }
+·Pacientes --> Key:dni  Value: {nombre, apellido, fecha_nacimiento, id_hospital, id_historial, id_médico, sexo}
+·Especialidad --> Key:id Value:nombre 
+·Hospital --> Key:id Value:nombre_hospital
+·Historial --> Key:dni Value:{fecha_creacion, [ids]expedientes}
+·Expedientes --> Key:id Value:{username_medico, observaciones, fecha_creación, id_especialidad}
+
+
+INTERFAZ:
+    -COMPROBAR PACIENTE REPETIDO EN DAR ALTA PACIENTE
+    -COMPROBAR QUE LOS DATOS DE DAR DE ALTA PACIENTE SEAN CORRECTOS
+
+CIFRADO:
+    -cifrado-string2file--> es para la base de datos??
+    -cifra.go-->qué es?
+
+COSAS:
+    -El token que genera por defecto el servidor es un token muy simple, por ello tiene que cumplir dos condiciones:
+        #No predecible
+        #Tiene que tener caducidad
+        El token tienen que almacenar la fecha en la que se ha añadidido para ver si ha caducado, y eliminarlo en caso positivo.
+        Para ello, modificar la función isTokenValid. Cuando el token no sea válido en usuario tiene que volver a autenticarse o 
+        puede hacerse que el token se renueve solo hasta que el usuario cierre la sesión.
+
+        COMPROBAR QUE EL TOKEN PERTENEZCA AL USUARIO AÑADIENDO USUARIO AL TOKEN Y ELIMINANDO SESSIONS NOS FALTA ESTO último
+
+
+
+
+
+COSAS EXTRAS:
+    TOPT (EL PROFESOR TIENE CÓDIGO)
+    ROLES, FIRMA DIGITAL
+    JWT (HAY CÓDIGO DE EJEMPLO EN CLASSROOM)
+    HACER WEB DE LA INTERFAZ-->SE PUEDE HACER CON WAILS(COMPLEJO) O LORCA(MÁS CUTRE)
+
+
+COSAS QUE HACER: 
+revisar que la ver expedientes funcione
+jwt 
+cifrado base datos
