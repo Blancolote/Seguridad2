@@ -2,33 +2,82 @@ package client
 
 import (
 	"bytes"
+	"compress/zlib"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha512"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
-	"time"
-
 	"prac/pkg/api"
 	"prac/pkg/ui"
+	"strings"
+	"time"
+	"unicode"
 )
+
+var resp struct {
+	Success     int      `json:"success"`
+	Message     string   `json:"message"`
+	Token       string   `json:"token"`
+	Expedientes [][]byte `json:"expedientes,omitempty"`
+}
 
 // client estructura interna no exportada que controla
 // el estado de la sesión (usuario, token) y logger.
 type client struct {
 	log              *log.Logger
+	httpCliente      *http.Client
 	currentUser      string
-	authToken        api.Token
-	currentSpecialty int //nuevo
-	currentHospital  int //nuevo
+	authToken        string
+	currentSpecialty string //nuevo
+	currentHospital  string //nuevo
 	currentDNI       string
 }
 
-type Observaciones struct {
-	Fecha_actualizacion string `json:"fecha_actualizacion"`
-	Diagnostico         string `json:"diagnostico"`
-	Medico              string `json:"medico"`
+func chk(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+func encrypt(data, key []byte) (out []byte) {
+	out = make([]byte, len(data)+16)    // reservamos espacio para el IV al principio
+	rand.Read(out[:16])                 // generamos el IV
+	blk, err := aes.NewCipher(key)      // cifrador en bloque (AES), usa key
+	chk(err)                            // comprobamos el error
+	ctr := cipher.NewCTR(blk, out[:16]) // cifrador en flujo: modo CTR, usa IV
+	ctr.XORKeyStream(out[16:], data)    // ciframos los datos
+	return
+}
+
+func decrypt(data, key []byte) (out []byte) {
+	out = make([]byte, len(data)-16)     // la salida no va a tener el IV
+	blk, err := aes.NewCipher(key)       // cifrador en bloque (AES), usa key
+	chk(err)                             // comprobamos el error
+	ctr := cipher.NewCTR(blk, data[:16]) // cifrador en flujo: modo CTR, usa IV
+	ctr.XORKeyStream(out, data[16:])     // desciframos (doble cifrado) los datos
+	return
+}
+
+// función para comprimir
+func compress(data []byte) []byte {
+	var b bytes.Buffer      // b contendrá los datos comprimidos (tamaño variable)
+	w := zlib.NewWriter(&b) // escritor que comprime sobre b
+	w.Write(data)           // escribimos los datos
+	w.Close()               // cerramos el escritor (buffering)
+	return b.Bytes()        // devolvemos los datos comprimidos
+}
+
+func encode64(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data) // sólo utiliza caracteres "imprimibles"
 }
 
 // Run es la única función exportada de este paquete.
@@ -39,6 +88,13 @@ func Run() {
 	c := &client{
 		log: log.New(os.Stdout, "[cli] ", log.LstdFlags),
 	}
+
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	c.httpCliente = &http.Client{Transport: tr}
+
 	c.runLoop()
 }
 
@@ -46,6 +102,7 @@ func Run() {
 // Si NO hay usuario logueado, se muestran ciertas opciones;
 // si SÍ hay usuario logueado, se muestran otras.
 func (c *client) runLoop() {
+
 	for {
 		ui.ClearScreen()
 
@@ -116,28 +173,47 @@ func (c *client) runLoop() {
 // registerUser pide credenciales y las envía al servidor para un registro.
 // Si el registro es exitoso, se intenta el login automático.
 func (c *client) registerUser() {
+
 	ui.ClearScreen()
 	fmt.Println("** Registro de usuario **")
+
+	// generamos un par de claves (privada, pública) para el servidor
+	pkClient, err := rsa.GenerateKey(rand.Reader, 1024)
+	chk(err)
+	pkClient.Precompute() // aceleramos su uso con un precálculo
+
+	pkJSON, err := json.Marshal(&pkClient) // codificamos con JSON
+	chk(err)
+
+	keyPub := pkClient.Public()           // extraemos la clave pública por separado
+	pubJSON, err := json.Marshal(&keyPub) // y codificamos con JSON
+	chk(err)
 
 	username := ui.ReadInput("Nombre de usuario")
 	password := ui.ReadInput("Contraseña")
 	apellido := ui.ReadInput("Apellido")
-	especialidad := ui.ReadInt("ID de especialidad") //ID?
-	hospital := ui.ReadInt("ID de hospital")         //ID???
+	especialidad := ui.ReadInput("ID de especialidad") //ID?
+	hospital := ui.ReadInput("ID de hospital")
 
-	// Enviamos la acción al servidor
-	res := c.sendRequest(api.Request{
-		Action:       api.ActionRegister,
-		Username:     username,
-		Password:     password,
-		Apellido:     apellido,
-		Especialidad: especialidad,
-		Hospital:     hospital,
-	})
+	keyClient := sha512.Sum512([]byte(password))
+	keyLogin := keyClient[:32]  // una mitad para el login (256 bits)
+	keyData := keyClient[32:64] // la otra para los datos (256 bits)
 
-	// Mostramos resultado
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
+	data := url.Values{}
+	data.Set("cmd", "register")
+	data.Set("username", username)
+	data.Set("password", encode64([]byte(keyLogin)))
+	data.Set("apellido", apellido)
+	data.Set("especialidad", especialidad)
+	data.Set("hospital", hospital)
+	data.Set("pubkey", encode64(compress(pubJSON)))
+
+	// comprimimos, ciframos y codificamos la clave privada
+	data.Set("prikey", encode64(encrypt(compress(pkJSON), keyData)))
+
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data) // enviamos por POST
+	chk(err)
+	io.Copy(os.Stdout, r.Body) // mostramos el cuerpo de la respuesta (es un reader)
 
 }
 
@@ -149,20 +225,32 @@ func (c *client) loginUser() {
 	username := ui.ReadInput("Nombre de usuario")
 	password := ui.ReadInput("Contraseña")
 
-	res := c.sendRequest(api.Request{
-		Action:   api.ActionLogin,
-		Username: username,
-		Password: password,
-	})
+	keyClient := sha512.Sum512([]byte(password))
+	keyLogin := keyClient[:32] // una mitad para el login (256 bits)
 
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
+	// generamos un par de claves (privada, pública) para el servidor
+	pkClient, err := rsa.GenerateKey(rand.Reader, 1024)
+	chk(err)
+	pkClient.Precompute() // aceleramos su uso con un precálculo
 
-	// Si login fue exitoso, guardamos currentUser y el token.
-	if res.Success == 1 {
+	data := url.Values{}
+	data.Set("cmd", "login")                 // comando (string)
+	data.Set("username", username)           // usuario (string)
+	data.Set("password", encode64(keyLogin)) // contraseña (a base64 porque es []byte)
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+	chk(err)
+	body, err := io.ReadAll(r.Body)
+	chk(err)
+
+	err = json.Unmarshal(body, &resp)
+	chk(err)
+
+	if resp.Success == 1 {
 		c.currentUser = username
-		c.authToken = res.Token
-		fmt.Println("Sesión iniciada con éxito. Token guardado.")
+		c.authToken = resp.Token
+	}
+	if resp.Success == -1 {
+		fmt.Println(resp.Message)
 	}
 }
 
@@ -171,20 +259,27 @@ func (c *client) verHistorialPaciente() {
 	fmt.Println("** Ver historial del paciente **")
 
 	dni := ui.ReadInput("DNI del paciente: ")
-	res := c.sendRequest(api.Request{
-		Action:   api.ActionObtenerExpedientes,
-		Username: c.currentUser,
-		Token:    c.authToken,
-		DNI:      dni,
-	})
 
-	if res.Success == 0 {
+	data := url.Values{}
+	data.Set("cmd", "verHistorialPaciente")
+	data.Set("token", c.authToken)
+	data.Set("username", c.currentUser)
+	data.Set("dni", dni)
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+	chk(err)
+	body, err := io.ReadAll(r.Body)
+	chk(err)
+
+	err = json.Unmarshal(body, &resp)
+	chk(err)
+
+	if resp.Success == 0 {
 		c.logoutUser()
 		return
 	}
 
-	if res.Success == -1 {
-		fmt.Println("Mensaje:", res.Message)
+	if resp.Success == -1 {
+		fmt.Println("Mensaje:", resp.Message)
 		if ui.Confirm("¿Desea dar de alta al paciente? (s/n)") {
 			c.darAltaPaciente()
 		}
@@ -192,25 +287,51 @@ func (c *client) verHistorialPaciente() {
 	}
 	c.currentDNI = dni // Guardamos el DNI actual
 
+	c.menuExpedientes(dni)
+}
+func (c *client) menuExpedientes(dni string) {
 	for {
 		ui.ClearScreen()
 		fmt.Printf("Historial del paciente con DNI %s\n", dni)
-		options := []string{
-			"Crear expediente",
-			"Elegir expediente",
-			"Salir",
-		}
-		choice := ui.PrintMenu("Opciones", options)
+		data := url.Values{}
+		data.Set("cmd", "verHistorialPaciente")
+		data.Set("token", c.authToken)
+		data.Set("username", c.currentUser)
+		data.Set("dni", dni)
+		r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+		chk(err)
+		body, err := io.ReadAll(r.Body)
+		chk(err)
 
-		switch choice {
-		case 1: // Crear expediente
-			c.crearExpediente()
-		case 2: // Elegir expediente
-			c.elegirExpediente(c.currentDNI)
-		case 3: // Salir
+		err = json.Unmarshal(body, &resp)
+		chk(err)
+
+		if resp.Success == 0 {
+			c.logoutUser()
 			return
 		}
 
+		if resp.Success != 1 {
+			fmt.Println("Error al obtener expedientes:", resp.Message)
+			break
+		}
+		// Mostrar opciones
+		options := []string{
+			"Crear nuevo expediente",
+			"Ver expedientes existentes",
+			"Volver",
+		}
+
+		choice := ui.PrintMenu("Opciones", options)
+
+		switch choice {
+		case 1:
+			c.crearExpediente()
+		case 2:
+			c.mostrarExpedientes(resp.Expedientes)
+		case 3:
+			return
+		}
 	}
 }
 
@@ -219,139 +340,30 @@ func (c *client) crearExpediente() {
 	fmt.Println("** Crear nuevo expediente **")
 
 	observaciones := ui.ReadInput("Observaciones: ")
+	tratamiento := ui.ReadInput("Tratamiento: ")
+	data := url.Values{}
+	data.Set("cmd", "crearExpediente")
+	data.Set("token", c.authToken)
+	data.Set("diagnostico", observaciones)
+	data.Set("username", c.currentUser)
+	data.Set("dni", c.currentDNI)
+	data.Set("tratamiento", tratamiento)
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+	chk(err)
+	body, err := io.ReadAll(r.Body)
+	chk(err)
 
-	fmt.Println("DNI:", c.currentDNI)
-	fmt.Println(c.authToken.Value)
-	fmt.Println(c.currentUser)
-	fmt.Println(observaciones)
+	err = json.Unmarshal(body, &resp)
+	chk(err)
 
-	// Enviar solicitud al servidor
-	res := c.sendRequest(api.Request{
-		Action:      api.ActionCrearExpediente,
-		Token:       c.authToken,
-		Username:    c.currentUser,
-		Diagnostico: observaciones,
-		DNI:         c.currentDNI,
-	})
-
-	if res.Success == 0 {
+	if resp.Success == 0 {
 		c.logoutUser()
 		return
 	}
 
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
+	fmt.Println("Éxito:", resp.Success)
+	fmt.Println("Mensaje:", resp.Message)
 	ui.Pause("Pulsa [Enter] para continuar...")
-}
-
-func (c *client) elegirExpediente(dni string) {
-	ui.ClearScreen()
-	fmt.Println("** Elegir expediente **")
-
-	// Obtener la lista de expedientes del servidor
-	res := c.sendRequest(api.Request{
-		Action: api.ActionObtenerExpedientes,
-		Token:  c.authToken,
-		DNI:    dni,
-	})
-
-	if res.Success == 0 {
-		c.logoutUser()
-		return
-	}
-
-	if res.Success == 1 {
-		fmt.Println("Mensaje:", res.Message)
-		return
-	}
-
-	// Parsear los expedientes
-	type Expediente struct {
-		Username      string          `json:"username"`
-		Observaciones []Observaciones `json:"observaciones"`
-		FechaCreacion string          `json:"fecha_creacion"`
-		Especialidad  int             `json:"especialidad"`
-	}
-
-	var listaExpedientes []Expediente
-	for _, expBytes := range res.Expedientes {
-		var exp Expediente
-		if err := json.Unmarshal(expBytes, &exp); err != nil {
-			fmt.Println("Error al procesar expediente:", err)
-			continue
-		}
-		listaExpedientes = append(listaExpedientes, exp)
-	}
-
-	if len(listaExpedientes) == 0 {
-		fmt.Println("No se encontraron expedientes válidos")
-		ui.Pause("Pulsa [Enter] para continuar...")
-
-	} else {
-		for {
-			ui.ClearScreen()
-			fmt.Printf("Expedientes de %s:\n", dni)
-			options := make([]string, len(listaExpedientes))
-			for i, exp := range listaExpedientes {
-				options[i] = fmt.Sprintf("Fecha: %s - Observaciones: %s", exp.FechaCreacion, exp.Observaciones)
-			}
-			options = append(options, "Volver")
-
-			choice := ui.PrintMenu("Seleccionar expediente", options)
-			if choice == len(options) {
-				return
-			}
-
-			selectedExp := listaExpedientes[choice-1]
-
-			// Submenú para el expediente seleccionado
-			ui.ClearScreen()
-			fmt.Printf("Fecha: %s\n", selectedExp.FechaCreacion)
-			subOptions := []string{"Visualizar", "Editar", "Volver"}
-			subChoice := ui.PrintMenu("Opciones", subOptions)
-
-			switch subChoice {
-			case 1: // Visualizar
-				fmt.Println("Observaciones:", selectedExp.Observaciones)
-				fmt.Println("Creado por:", selectedExp.Username)
-				fmt.Println("Fecha creación:", selectedExp.FechaCreacion)
-				fmt.Println("Especialidad:", selectedExp.Especialidad)
-				ui.Pause("Pulsa [Enter] para continuar...")
-			case 2: // Editar
-				observaciones := ui.ReadInput("Nueva observación: ")
-				c.actualizarExpediente(choice-1, observaciones)
-			case 3: // Volver
-				continue
-			}
-		}
-
-	}
-}
-
-// funcion Actualizar Expediente, se pasa como argumento el numero del expediente, el nombre, observaciones y token
-func (c *client) actualizarExpediente(expID int, observaciones string) {
-	ui.ClearScreen()
-	fmt.Println("** Actualizar expediente **")
-
-	// Obtener la fecha actual
-	fechaActual := time.Now().Format("2006-01-02") // Formato YYYY-MM-DD, ajusta si necesitas otro
-
-	// Enviar la solicitud al servidor
-	res := c.sendRequest(api.Request{
-		Action:      api.ActionModificarExpediente,
-		Token:       c.authToken,
-		ID:          expID,
-		Username:    c.currentUser,
-		Diagnostico: observaciones,
-		Fecha:       fechaActual,
-	})
-
-	if res.Success == 0 {
-		c.logoutUser()
-	}
-
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
 }
 
 func (c *client) darAltaPaciente() {
@@ -360,83 +372,55 @@ func (c *client) darAltaPaciente() {
 
 	nombre := ui.ReadInput("Nombre: ")
 	apellido := ui.ReadInput("Apellido: ")
-	fecha_nacimiento := ui.ReadInput("Fecha de nacimiento (AAAA-dd-mm): ")
-	dni := ui.ReadInput("DNI del paciente: ")
-	sexo := ui.ReadInput("Sexo (H,M,O)")
+	var fecha_nacimiento string
+	for {
+		fecha_nacimiento = ui.ReadInput("Fecha de nacimiento (AAAA-dd-mm): ")
+		_, err := time.Parse("2006-01-02", fecha_nacimiento) // Formato AAAA-DD-MM
+		if err == nil {
+			break
+		}
+		fmt.Println("Formato inválido. Usa AAAA-DD-MM (ejemplo: 1990-03-15)")
+	}
+	var dni string
+	for {
+		dni = ui.ReadInput("DNI del paciente: ")
+		if validarDNI(dni) {
+			break
+		}
+		fmt.Println("DNI inválido. Debe tener 9 caracteres y terminar en una letra (ejemplo: 12345678A)")
+	}
+	var sexo string
+	for {
+		sexo = strings.ToUpper(ui.ReadInput("Sexo (H,M,O): "))
 
-	// Enviamos la acción al servidor
-	res := c.sendRequest(api.Request{
-		Action:   api.ActionDarAlta,
-		Token:    c.authToken,
-		Username: c.currentUser,
-		Nombre:   nombre,
-		Apellido: apellido,
-		Fecha:    fecha_nacimiento,
-		Sexo:     sexo,
-		DNI:      dni,
-		Hospital: c.currentHospital,
-	})
+		if sexo == "H" || sexo == "M" || sexo == "O" {
+			break
+		}
+		fmt.Println("Sexo inválido. Debe ser H, M o O")
+	}
 
-	if res.Success == 0 {
+	data := url.Values{}
+	data.Set("cmd", "addPaciente")
+	data.Set("nom_Paciente", nombre)
+	data.Set("apellido", apellido)
+	data.Set("fecha", fecha_nacimiento)
+	data.Set("dni", dni)
+	data.Set("sexo", sexo)
+	data.Set("username", c.currentUser)
+	data.Set("token", c.authToken)
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+	chk(err)
+	body, err := io.ReadAll(r.Body)
+	chk(err)
+
+	err = json.Unmarshal(body, &resp)
+	chk(err)
+
+	if resp.Success == 0 {
 		c.logoutUser()
 	}
-
-	// Mostramos resultado
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
-}
-
-// fetchData pide datos privados al servidor.
-// El servidor devuelve la data asociada al usuario logueado.
-func (c *client) fetchData() {
-	ui.ClearScreen()
-	fmt.Println("** Obtener datos del usuario **")
-
-	// Chequeo básico de que haya sesión
-	if c.currentUser == "" || c.authToken.Value == "" {
-		fmt.Println("No estás logueado. Inicia sesión primero.")
-		return
-	}
-
-	// Hacemos la request con ActionFetchData
-	res := c.sendRequest(api.Request{
-		Action:   api.ActionFetchData,
-		Username: c.currentUser,
-		Token:    c.authToken,
-	})
-
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
-
-	// Si fue exitoso, mostramos la data recibida
-	if res.Success == 1 {
-		fmt.Println("Tus datos:", res.Data)
-	}
-}
-
-// updateData pide nuevo texto y lo envía al servidor con ActionUpdateData.
-func (c *client) updateData() {
-	ui.ClearScreen()
-	fmt.Println("** Actualizar datos del usuario **")
-
-	if c.currentUser == "" || c.authToken.Value == "" {
-		fmt.Println("No estás logueado. Inicia sesión primero.")
-		return
-	}
-
-	// Leemos la nueva Data
-	newData := ui.ReadInput("Introduce el contenido que desees almacenar")
-
-	// Enviamos la solicitud de actualización
-	res := c.sendRequest(api.Request{
-		Action:   api.ActionUpdateData,
-		Username: c.currentUser,
-		Token:    c.authToken,
-		Data:     newData,
-	})
-
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
+	fmt.Println("Éxito:", resp.Success)
+	fmt.Println("Mensaje:", resp.Message)
 }
 
 // logoutUser llama a la acción logout en el servidor, y si es exitosa,
@@ -445,44 +429,31 @@ func (c *client) logoutUser() {
 	ui.ClearScreen()
 	fmt.Println("** Cerrar sesión **")
 
-	if c.currentUser == "" || c.authToken.Value == "" {
+	if c.currentUser == "" || c.authToken == "" {
 		fmt.Println("No estás logueado.")
 		return
 	}
 
-	// Llamamos al servidor con la acción ActionLogout
-	res := c.sendRequest(api.Request{
-		Action:   api.ActionLogout,
-		Username: c.currentUser,
-		Token:    c.authToken,
-	})
+	data := url.Values{}
+	data.Set("cmd", "logout")
+	data.Set("username", c.currentUser)
+	data.Set("token", c.authToken)
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+	chk(err)
+	body, err := io.ReadAll(r.Body)
+	chk(err)
 
-	fmt.Println("Éxito:", res.Success)
-	fmt.Println("Mensaje:", res.Message)
+	err = json.Unmarshal(body, &resp)
+	chk(err)
+
+	fmt.Println("Éxito:", resp.Success)
+	fmt.Println("Mensaje:", resp.Message)
 
 	// Si fue exitoso, limpiamos la sesión local.
-	if res.Success == 1 {
+	if resp.Success == 1 {
 		c.currentUser = ""
-		c.authToken = api.Token{}
+		c.authToken = ""
 	}
-}
-
-// sendRequest envía un POST JSON a la URL del servidor y
-// devuelve la respuesta decodificada. Se usa para todas las acciones.
-func (c *client) sendRequest(req api.Request) api.Response {
-	jsonData, _ := json.Marshal(req)
-	resp, err := http.Post("http://localhost:8080/api", "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		fmt.Println("Error al contactar con el servidor:", err)
-		return api.Response{Success: -1, Message: "Error de conexión"}
-	}
-	defer resp.Body.Close()
-
-	// Leemos el body de respuesta y lo desempaquetamos en un api.Response
-	body, _ := io.ReadAll(resp.Body)
-	var res api.Response
-	_ = json.Unmarshal(body, &res)
-	return res
 }
 
 func min(a, b int) int {
@@ -490,4 +461,205 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func validarDNI(dni string) bool {
+	// 1. Longitud exacta de 9 caracteres
+	if len(dni) != 9 {
+		return false
+	}
+
+	// 2. Primeros 8 caracteres son dígitos
+	for _, c := range dni[:8] {
+		if !unicode.IsDigit(c) {
+			return false
+		}
+	}
+
+	// 3. Último carácter es letra (mayúscula o minúscula)
+	ultimo := rune(dni[8])
+	return unicode.IsLetter(ultimo)
+}
+
+func (c *client) obtenerDNIPaciente() (string, error) {
+	for {
+		dni := ui.ReadInput("DNI del paciente: ")
+		if validarDNI(dni) {
+			return dni, nil
+		}
+		fmt.Println("DNI inválido. Debe tener 9 caracteres y terminar en una letra (ejemplo: 12345678A)")
+	}
+}
+
+func (c *client) mostrarExpedientes(expedientes [][]byte) {
+	for {
+		ui.ClearScreen()
+		fmt.Println("** Expedientes del paciente **")
+		var exp api.Expediente
+
+		uniqueExpedientes := make(map[string]bool)
+		counter := 1
+		lista_expedientes := make([]api.Expediente, 0)
+		for _, expData := range expedientes {
+
+			if err := json.Unmarshal(expData, &exp); err != nil {
+				fmt.Printf("Error unmarshaling expediente: %v\n", err)
+				continue
+			} else {
+				lista_expedientes = append(lista_expedientes, exp)
+			}
+
+			if _, exists := uniqueExpedientes[exp.ID]; exists {
+				continue
+			}
+			uniqueExpedientes[exp.ID] = true
+
+			if len(exp.Observaciones) > 0 {
+				fmt.Printf("%d. [ID: %s] %s - %s (por %s)\n",
+					counter,
+					exp.ID,
+					exp.Observaciones[0].Fecha_actualizacion,
+					exp.Observaciones[0].Diagnostico,
+					exp.Username)
+				counter++
+			}
+
+		}
+
+		fmt.Println("\n0. Volver")
+		fmt.Print("\nIngrese el ID del expediente a gestionar: ")
+		var input string
+		fmt.Scanln(&input)
+
+		// Opción para volver
+		if input == "0" {
+			return
+		}
+
+		// Buscar el expediente seleccionado
+		var expedienteSeleccionado []byte
+
+		for _, expData := range expedientes {
+
+			if err := json.Unmarshal(expData, &exp); err != nil {
+				fmt.Printf("Error unmarshaling expediente: %v\n", err)
+				continue
+			}
+			if exp.ID == input {
+				expedienteSeleccionado = expData
+			}
+
+		}
+
+		if expedienteSeleccionado == nil {
+			fmt.Printf("No se encontró un expediente con ID %s\n", input)
+			ui.Pause("Pulsa [Enter] para continuar...")
+			continue
+		}
+
+		// Gestionar el expediente seleccionado
+		c.gestionarExpediente(expedienteSeleccionado)
+
+	}
+
+}
+
+func (c *client) gestionarExpediente(expedienteData []byte) {
+	var exp struct {
+		ID             string              `json:"id"`
+		Fecha_creacion string              `json:"fecha_creacion"`
+		Observaciones  []api.Observaciones `json:"observaciones"`
+		Medico         string              `json:"medico"`
+	}
+
+	if err := json.Unmarshal(expedienteData, &exp); err != nil {
+		fmt.Println("Error al procesar expediente:", err)
+		ui.Pause("Pulsa [Enter] para continuar...")
+		return
+	}
+
+	for {
+		ui.ClearScreen()
+		fmt.Printf("=== Expediente ID: %s ===\n", exp.ID)
+		fmt.Printf("Fecha creación: %s\n", exp.Fecha_creacion)
+		fmt.Printf("Médico responsable: %s\n", exp.Medico)
+		fmt.Println("\n=== Observaciones ===")
+
+		for i, obs := range exp.Observaciones {
+			fmt.Printf("%d. [%s] %s\n", i+1, obs.Fecha_actualizacion, truncate(obs.Diagnostico, 60))
+		}
+
+		fmt.Println("\n1. Ver observación detallada")
+		fmt.Println("2. Añadir nueva observación")
+		fmt.Println("0. Volver")
+
+		opcion := ui.ReadInt("Seleccione una opción:")
+
+		switch opcion {
+		case 0:
+			return
+		case 1:
+			if len(exp.Observaciones) == 0 {
+				fmt.Println("No hay observaciones disponibles")
+				ui.Pause("Pulsa [Enter] para continuar...")
+				continue
+			}
+
+			numObs := ui.ReadInt("Ingrese el número de observación a ver:")
+			if numObs < 1 || numObs > len(exp.Observaciones) {
+				fmt.Println("Número de observación inválido")
+				ui.Pause("Pulsa [Enter] para continuar...")
+				continue
+			}
+
+			obs := exp.Observaciones[numObs-1]
+			ui.ClearScreen()
+			fmt.Printf("=== Observación %d ===\n", numObs)
+			fmt.Printf("Fecha: %s\n", obs.Fecha_actualizacion)
+			fmt.Printf("Médico: %s\n", obs.Medico)
+			fmt.Printf("Diagnóstico:\n%s\n", obs.Diagnostico)
+			ui.Pause("Pulsa [Enter] para continuar...")
+
+		case 2:
+			nuevaObs := ui.ReadInput("Ingrese la nueva observación:")
+			nuevoTratamiento := ui.ReadInput("Ingrese el nuevo tratamiento:")
+			data := url.Values{}
+			data.Set("cmd", "modificarExpediente")
+			data.Set("username", c.currentUser)
+			data.Set("token", c.authToken)
+			data.Set("diagnostico", nuevaObs)
+			data.Set("dni", c.currentDNI)
+			data.Set("fecha", time.Now().Format("2006-01-02"))
+			data.Set("id", exp.ID)
+			data.Set("tratamiento", nuevoTratamiento)
+			r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+			chk(err)
+			body, err := io.ReadAll(r.Body)
+			chk(err)
+
+			err = json.Unmarshal(body, &resp)
+			chk(err)
+			if resp.Success == 1 {
+				fmt.Println("Observación añadida correctamente")
+				// Actualizamos los datos locales
+				var updatedExp struct {
+					Observaciones []api.Observaciones `json:"observaciones"`
+				}
+				if err := json.Unmarshal(expedienteData, &updatedExp); err == nil {
+					exp.Observaciones = updatedExp.Observaciones
+				}
+			} else {
+				fmt.Println("Error:", resp.Message)
+			}
+			ui.Pause("Pulsa [Enter] para continuar...")
+		}
+	}
+}
+
+// Función auxiliar para truncar texto
+func truncate(text string, length int) string {
+	if len(text) <= length {
+		return text
+	}
+	return text[:length-3] + "..."
 }

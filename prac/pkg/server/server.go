@@ -3,10 +3,13 @@
 package server
 
 import (
+	"bytes"
+	"compress/zlib"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -16,10 +19,14 @@ import (
 	"strings"
 
 	"time"
+
+	"golang.org/x/crypto/scrypt"
+
+	"github.com/dgrijalva/jwt-go"
 )
 
-var currentHospital int
-var currentSpecialty int
+var currentHospital string
+var currentSpecialty string
 
 // server encapsula el estado de nuestro servidor
 type server struct {
@@ -37,16 +44,6 @@ type Usuario struct {
 	Hospital     int    `json:"hospital"`
 }
 
-type Paciente struct {
-	Nombre           string `json:"nombre"`
-	Apellido         string `json:"apellido"`
-	Fecha_nacimiento string `json:"fecha_nacimiento"`
-	Sexo             string `json:"sexo"`
-	Hospital         int    `json:"hospital"`
-	Historial        string `json:"historial"`
-	Medico           string `json:"medico"`
-}
-
 type Hospital struct {
 	Nombre string `json:"nombre"`
 }
@@ -60,17 +57,31 @@ type Historial struct {
 	Expedientes    []int  `json:"expedientes"` //tener en cuenta que para actualizarlos hay que coger la lista existente y añadirle uno nuevo
 }
 
-type Observaciones struct {
-	Fecha_actualizacion string `json:"fecha_actualizacion"`
-	Diagnostico         string `json:"diagnostico"`
-	Medico              string `json:"medico"`
+// ------------------EMPIEZO CON HTTPS MODIFICACIONES---------------------------
+
+type user struct { //name se usará como id en los namespaces
+	Hash         []byte
+	Salt         []byte
+	Private      string
+	Public       string
+	Apellido     string `json:"apellido,omitempty"`
+	Especialidad string `json:"especialidad,omitempty"`
+	Hospital     string `json:"hospital,omitempty"`
 }
 
-type Expediente struct {
-	Medico         string          `json:"medico"`
-	Observaciones  []Observaciones `json:"observaciones"`
-	Fecha_creacion string          `json:"fecha_creacion"`
-	Especialidad   int             `json:"especialidad"`
+func chk(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+
+func (s *server) comprobarHospEsp(namespace string, id int) bool {
+	id_int := strconv.Itoa(id)
+	_, err := s.db.Get(namespace, []byte(id_int))
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 // Run inicia la base de datos y arranca el servidor HTTP.
@@ -90,103 +101,73 @@ func Run() error {
 	// Al terminar, cerramos la base de datos
 	defer srv.db.Close()
 
-	// Construimos un mux y asociamos /api a nuestro apiHandler,
-	mux := http.NewServeMux()
-	mux.Handle("/api", http.HandlerFunc(srv.apiHandler))
+	http.HandleFunc("/", srv.handler) // asignamos un handler global
 
-	// Iniciamos el servidor HTTP.
-	err = http.ListenAndServe(":8080", mux)
+	// escuchamos el puerto 10443 con https y comprobamos el error
+	// Para generar certificados autofirmados con openssl usar:
+	//    openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/C=ES/ST=Alicante/L=Alicante/O=UA/OU=Org/CN=www.ua.com"
+	chk(http.ListenAndServeTLS(":10443", "cert.pem", "key.pem", nil))
 
 	return err
 }
 
 // apiHandler descodifica la solicitud JSON, la despacha
 // a la función correspondiente y devuelve la respuesta JSON.
-func (s *server) apiHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *server) handler(w http.ResponseWriter, req *http.Request) {
 
-	// Decodificamos la solicitud en una estructura api.Request
-	var req api.Request
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Error en el formato JSON", http.StatusBadRequest)
-		return
-	}
-
-	// Despacho según la acción solicitada
-	var res api.Response
-	switch req.Action {
-	case api.ActionRegister:
-		res = s.registerUser(req)
-	case api.ActionLogin:
-		res = s.loginUser(req)
-	case api.ActionFetchData:
-		res = s.fetchData(req)
-	case api.ActionUpdateData:
-		res = s.updateData(req)
-	case api.ActionLogout:
-		res = s.logoutUser(req)
-	case api.ActionObtenerExpedientes:
-		res = s.obtenerExpedientes(req)
-	case api.ActionDarAlta:
-		res = s.addPaciente(req)
-	case api.ActionCrearExpediente:
-		res = s.anyadirExpediente(req)
-	case api.ActionModificarExpediente:
-		res = s.anyadirObservaciones(req)
-
-	default:
-		res = api.Response{Success: -1, Message: "Acción desconocida"}
-	}
-
-	// Enviamos la respuesta en formato JSON
+	//if req.Method != http.MethodPost {
+	//http.Error(w, "Método no permitido", http.StatusMethodNotAllowed)
+	//return
+	//}
+	req.ParseForm()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
-}
 
-// generateToken crea un token único incrementando un contador interno (inseguro)
-func (s *server) generateToken(expirationDuration time.Duration) (api.Token, error) {
-	// Generar bytes aleatorios (32 bytes para buena entropía)
-	bytes := make([]byte, 32)
-	_, err := rand.Read(bytes)
-	if err != nil {
-		return api.Token{}, err
+	switch req.Form.Get("cmd") {
+	case "register":
+		res := s.registerUser(req)
+		response(w, res)
+	case "login":
+		res := s.loginUser(req)
+		response(w, res)
+	case "addPaciente":
+		res := s.addPaciente(req)
+		response(w, res)
+	case "verHistorialPaciente":
+		res := s.obtenerExpedientes(req)
+		response(w, res)
+	case "crearExpediente":
+		res := s.anyadirExpediente(req)
+		response(w, res)
+	case "logout":
+		res := s.logoutUser(req)
+		response(w, res)
+	case "modificarExpediente":
+		res := s.anyadirObservaciones(req)
+		response(w, res)
 	}
 
-	// Codificar los bytes en base64 para obtener una cadena
-	tokenValue := base64.URLEncoding.EncodeToString(bytes)
-
-	// Calcular fecha de expiración
-	expiresAt := time.Now().Add(expirationDuration)
-
-	return api.Token{
-		Value:     tokenValue,
-		ExpiresAt: expiresAt,
-	}, nil
 }
 
-func (s *server) obtenerUltimoID(namespace string) string {
+func (s *server) obtenerUltimoID(namespace string) (string, error) {
 	keys, err := s.db.ListKeys(namespace)
 	if err != nil {
-		return "Q"
+		return "", err
 	}
+
 	if len(keys) == 0 {
-		return "1"
+		return "1", nil
 	}
 
-	lastElement := string(keys[len(keys)-1])
-	fmt.Println("LastElemente: ", lastElement)
-	id_int, errAtoi := strconv.Atoi(lastElement)
-	if errAtoi != nil {
-		return "P"
+	// Convertir todas las keys a números y encontrar el máximo
+	maxID := 0
+	for _, key := range keys {
+		id, err := strconv.Atoi(string(key))
+		if err == nil && id > maxID {
+			maxID = id
+		}
 	}
 
-	id_int = id_int + 1
-
-	id_final := strconv.Itoa(id_int)
-	return id_final
+	return strconv.Itoa(maxID + 1), nil
 }
 
 func (s *server) obtenerIdHospital(nombre string) int {
@@ -215,102 +196,135 @@ func (s *server) obtenerIdHospital(nombre string) int {
 	return key
 }
 
-// registerUser registra un nuevo usuario, si no existe.
-// - Guardamos la contraseña en el namespace 'auth'
-// - Creamos entrada vacía en 'userdata' para el usuario
-func (s *server) registerUser(req api.Request) api.Response {
+func response(w io.Writer, res api.Response) {
+	r := res                       // formateamos respuesta
+	rJSON, err := json.Marshal(&r) // codificamos en JSON
+	chk(err)                       // comprobamos error
+	w.Write(rJSON)                 // escribimos el JSON resultante
+}
+
+// función para comprimir
+func compress(data []byte) []byte {
+	var b bytes.Buffer      // b contendrá los datos comprimidos (tamaño variable)
+	w := zlib.NewWriter(&b) // escritor que comprime sobre b
+	w.Write(data)           // escribimos los datos
+	w.Close()               // cerramos el escritor (buffering)
+	return b.Bytes()        // devolvemos los datos comprimidos
+}
+
+// función para descomprimir
+func decompress(data []byte) []byte {
+	var b bytes.Buffer // b contendrá los datos descomprimidos
+
+	r, err := zlib.NewReader(bytes.NewReader(data)) // lector descomprime al leer
+
+	chk(err)         // comprobamos el error
+	io.Copy(&b, r)   // copiamos del descompresor (r) al buffer (b)
+	r.Close()        // cerramos el lector (buffering)
+	return b.Bytes() // devolvemos los datos descomprimidos
+}
+
+// función para codificar de []bytes a string (Base64)
+func encode64(data []byte) string {
+	return base64.StdEncoding.EncodeToString(data) // sólo utiliza caracteres "imprimibles"
+}
+
+// función para decodificar de string a []bytes (Base64)
+func decode64(s string) []byte {
+	b, err := base64.StdEncoding.DecodeString(s) // recupera el formato original
+	chk(err)                                     // comprobamos el error
+	return b                                     // devolvemos los datos originales
+}
+
+// Función de re
+func (s *server) registerUser(req *http.Request) api.Response {
 	// Validación básica
-	if req.Username == "" || req.Password == "" || req.Apellido == "" || req.Especialidad == 0 || req.Hospital == 0 {
+	if req.Form.Get("username") == "" || req.Form.Get("password") == "" || req.Form.Get("apellido") == "" || req.Form.Get("especialidad") == "0" || req.Form.Get("hospital") == "0" {
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
 
 	// Verificamos si ya existe el usuario en 'auth'
-	exists, err := s.userExists(req.Username)
+	exists, err := s.userExists(req.Form.Get("Username"))
 	if err != nil {
-		return api.Response{Success: -1, Message: "Error al verificar usuario"}
+		return api.Response{Success: -1, Message: "No sé"}
 	}
 	if exists {
 		return api.Response{Success: -1, Message: "El usuario ya existe"}
 	}
 
-	usuario := Usuario{
-		Constraseña:  req.Password,
-		Apellido:     req.Apellido,
-		Especialidad: req.Especialidad,
-		Hospital:     req.Hospital,
+	name := req.Form.Get("username")               // nombre
+	salt := make([]byte, 16)                       // sal (16 bytes == 128 bits)
+	rand.Read(salt)                                // la sal es aleatoria               // reservamos mapa de datos de usuario
+	private := req.Form.Get("prikey")              // clave privada
+	public := req.Form.Get("pubkey")               // clave pública
+	password := decode64(req.Form.Get("password")) // contraseña (keyLogin)
+
+	hash, _ := scrypt.Key(password, salt, 16384, 8, 1, 32)
+	u := user{
+		Salt:         salt,
+		Hash:         hash,
+		Private:      private,
+		Public:       public,
+		Apellido:     req.Form.Get("apellidos"),
+		Hospital:     req.Form.Get("hospital"),
+		Especialidad: req.Form.Get("especialidad"),
+	}
+	u_json, _ := json.Marshal(u)
+
+	if err := s.db.Put("Usuarios", []byte(name), []byte(u_json)); err != nil {
+		return api.Response{Success: -1, Message: "Error al crear el usuario"}
 	}
 
-	jsonUsuario, errJson := json.Marshal(usuario)
-
-	if errJson != nil {
-		return api.Response{Success: -1, Message: "Los datos del Json del usuario están mal"}
-	}
-
-	if err := s.db.Put("Usuarios", []byte(req.Username), []byte(jsonUsuario)); err != nil {
-
-	}
-	return api.Response{Success: 1, Message: fmt.Sprintf("Usuario %s registrado correctamente", req.Username)}
+	return api.Response{Success: 1, Message: "Usuario creado"}
 }
 
 // loginUser valida credenciales en el namespace 'auth' y genera un token en 'sessions'.
-func (s *server) loginUser(req api.Request) api.Response {
-	if req.Username == "" || req.Password == "" {
+func (s *server) loginUser(req *http.Request) api.Response {
+	if req.Form.Get("username") == "" || req.Form.Get("password") == "" {
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
 
-	// Recogemos la contraseña guardada en 'auth'
-	userData, err := s.db.Get("Usuarios", []byte(req.Username))
+	// Se comprueba si el usuario existe
+	userData, err := s.db.Get("Usuarios", []byte(req.Form.Get("username")))
 
 	if err != nil {
 		return api.Response{Success: -1, Message: "Usuario no encontrado"}
 	}
 
-	var datosUsuario Usuario
+	var datosUsuario user
 	errUser := json.Unmarshal(userData, &datosUsuario)
 	if errUser != nil {
-		return api.Response{Success: -1, Message: "Estructura del usuario"}
-	}
-	storedPass := datosUsuario.Constraseña
-	// Comparamos
-	if string(storedPass) != req.Password {
-		return api.Response{Success: -1, Message: "Credenciales inválidas"}
+		return api.Response{Success: -1, Message: "Fallo en la estructura del usuario"}
 	}
 
-	// Generamos un nuevo token, lo guardamos en 'sessions'
-	token, errGenerateToken := s.generateToken(30 * time.Minute)
-	if errGenerateToken != nil {
-		return api.Response{Success: -1, Message: "Error creando el Token"}
+	password := decode64(req.Form.Get("password")) // obtenemos la contraseña
+	hash, _ := scrypt.Key(password, datosUsuario.Salt, 16384, 8, 1, 32)
+
+	if bytes.Compare(datosUsuario.Hash, hash) != 0 {
+		return api.Response{Success: -1, Message: "Contraseña incorrecta"}
 	}
 
-	tokenJson, _ := json.Marshal(token)
-	if err := s.db.Put("sessions", []byte(req.Username), []byte(tokenJson)); err != nil {
-		return api.Response{Success: -1, Message: "Error al crear sesión"}
-	}
+	token := crearToken(req.Form.Get("username"), 10)
 
-	var usuario Usuario
-	especialidadalactual, err := s.db.Get("Usuarios", []byte(req.Username))
-	errEsp := json.Unmarshal(especialidadalactual, &usuario)
+	currentSpecialty = datosUsuario.Especialidad
+	currentHospital = datosUsuario.Hospital
 
-	if errEsp != nil {
-		return api.Response{Success: -1, Message: "Erro al convertir hospital a struct"}
-	}
-
-	currentSpecialty = usuario.Especialidad
-	currentHospital = usuario.Hospital
-	fmt.Println("Token en el login ", token)
 	return api.Response{Success: 1, Message: "Login exitoso", Token: token}
 }
 
 // Obtener expedientes de la especialidad del médico
-func (s *server) obtenerExpedientes(req api.Request) api.Response {
-	if req.DNI == "" || req.Token.Value == "" {
+func (s *server) obtenerExpedientes(req *http.Request) api.Response {
+
+	if req.Form.Get("dni") == "" || req.Form.Get("token") == "" {
 		return api.Response{Success: -1, Message: "Faltan datos"}
 	}
-	if !s.isTokenValid(req.Token, req.Username) {
+	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+
+	if !ok {
 		return api.Response{Success: 0, Message: "Error en las credenciales: Token inválido o caducado"}
 	}
 
-	historial, err_hist := s.db.Get("Historiales", []byte(req.DNI))
+	historial, err_hist := s.db.Get("Historiales", []byte(req.Form.Get("dni")))
 
 	if err_hist != nil {
 		return api.Response{Success: -1, Message: "El Dni introducido es incorrecto"}
@@ -329,7 +343,7 @@ func (s *server) obtenerExpedientes(req api.Request) api.Response {
 		}
 
 		// Convertimos el JSON a un mapa para modificarlo
-		var expedienteStruct Expediente
+		var expedienteStruct api.Expediente
 		json.Unmarshal(expediente, &expedienteStruct)
 
 		info_expedientes = append(info_expedientes, expediente)
@@ -338,17 +352,23 @@ func (s *server) obtenerExpedientes(req api.Request) api.Response {
 	if err != nil {
 		return api.Response{Success: -1, Message: "No existe dicha especialidad"}
 	}
-
 	return api.Response{Success: 1, Message: "Expedientes obtenidos", Expedientes: info_expedientes}
 }
 
-func (s *server) addPaciente(req api.Request) api.Response {
-	if req.DNI == "" || req.Nombre == "" || req.Apellido == "" || req.Fecha == "" || req.Username == "" || req.Sexo == "" || req.Token.Value == "" {
+func (s *server) addPaciente(req *http.Request) api.Response {
+
+	if req.Form.Get("dni") == "" || req.Form.Get("nom_Paciente") == "" || req.Form.Get("apellido") == "" || req.Form.Get("fecha") == "" || req.Form.Get("username") == "" || req.Form.Get("sexo") == "" || req.Form.Get("token") == "" {
 		return api.Response{Success: -1, Message: "Faltan datos del paciente"}
 	}
 
-	if !s.isTokenValid(req.Token, req.Username) {
+	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	if !ok {
 		return api.Response{Success: 0, Message: "Error en las credenciales: Token inválido o caducado"}
+	}
+
+	_, errDNI := s.db.Get("Pacientes", []byte(req.Form.Get("dni")))
+	if errDNI == nil {
+		return api.Response{Success: -1, Message: "El paciente ya existe"}
 	}
 
 	fecha := time.Now()
@@ -365,20 +385,20 @@ func (s *server) addPaciente(req api.Request) api.Response {
 		return api.Response{Success: -1, Message: "Error creando json de historial"}
 	}
 
-	errHist := s.db.Put("Historiales", []byte(req.DNI), []byte(historial_json))
+	errHist := s.db.Put("Historiales", []byte(req.Form.Get("dni")), []byte(historial_json))
 
 	if errHist != nil {
 		return api.Response{Success: -1, Message: "Error creando historial en la base de datos"}
 	}
 
-	paciente := Paciente{
-		Nombre:           req.Nombre,
-		Apellido:         req.Apellido,
-		Fecha_nacimiento: req.Fecha,
+	paciente := api.Paciente{
+		Nombre:           req.Form.Get("nombre"),
+		Apellido:         req.Form.Get("apellido"),
+		Fecha_nacimiento: req.Form.Get("fecha"),
 		Hospital:         currentHospital,
-		Sexo:             req.Sexo,
-		Medico:           req.Username,
-		Historial:        req.DNI,
+		Sexo:             req.Form.Get("sexo"),
+		Medico:           req.Form.Get("username"),
+		Historial:        req.Form.Get("dni"),
 	}
 
 	paciente_json, errJson := json.Marshal(paciente)
@@ -387,7 +407,7 @@ func (s *server) addPaciente(req api.Request) api.Response {
 		return api.Response{Success: -1, Message: "No pueden convertirse los datos a json"}
 	}
 
-	err := s.db.Put("Pacientes", []byte(req.DNI), []byte(paciente_json))
+	err := s.db.Put("Pacientes", []byte(req.Form.Get("dni")), []byte(paciente_json))
 
 	if err != nil {
 		return api.Response{Success: -1, Message: "Error creando al paciente"}
@@ -396,66 +416,26 @@ func (s *server) addPaciente(req api.Request) api.Response {
 	return api.Response{Success: 1, Message: "Usuario creado"}
 }
 
-// fetchData verifica el token y retorna el contenido del namespace 'userdata'.
-func (s *server) fetchData(req api.Request) api.Response {
-	// Chequeo de credenciales
-	if req.Username == "" || req.Token.Value == "" {
+func (s *server) anyadirObservaciones(req *http.Request) api.Response {
+	if req.Form.Get("username") == "" || req.Form.Get("token") == "" || req.Form.Get("fecha") == "" || req.Form.Get("diagnostico") == "" || req.Form.Get("id") == "" || req.Form.Get("tratamiento") == "" {
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
-	if !s.isTokenValid(req.Token, req.Username) {
+	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	if !ok {
 		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
 	}
 
-	// Obtenemos los datos asociados al usuario desde 'userdata'
-	rawData, err := s.db.Get("userdata", []byte(req.Username))
-	if err != nil {
-		return api.Response{Success: -1, Message: "Error al obtener datos del usuario"}
+	observacion := api.Observaciones{
+		Fecha_actualizacion: req.Form.Get("fecha"),
+		Diagnostico:         req.Form.Get("diagnostico"),
+		Tratamiento:         req.Form.Get("tratamiento"),
 	}
-
-	return api.Response{
-		Success: 1,
-		Message: "Datos privados de " + req.Username,
-		Data:    string(rawData),
-	}
-}
-
-// updateData cambia el contenido de 'userdata' (los "datos" del usuario)
-// después de validar el token.
-func (s *server) updateData(req api.Request) api.Response {
-	// Chequeo de credenciales
-	if req.Username == "" || req.Token.Value == "" {
-		return api.Response{Success: -1, Message: "Faltan credenciales"}
-	}
-	if !s.isTokenValid(req.Token, req.Username) {
-		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
-	}
-
-	// Escribimos el nuevo dato en 'userdata'
-	if err := s.db.Put("userdata", []byte(req.Username), []byte(req.Data)); err != nil {
-		return api.Response{Success: -1, Message: "Error al actualizar datos del usuario"}
-	}
-
-	return api.Response{Success: 1, Message: "Datos de usuario actualizados"}
-}
-
-func (s *server) anyadirObservaciones(req api.Request) api.Response {
-	if req.Username == "" || req.Token.Value == "" || req.Fecha == "" || req.Diagnostico == "" || req.ID == 0 {
-		return api.Response{Success: -1, Message: "Faltan credenciales"}
-	}
-	if !s.isTokenValid(req.Token, req.Username) {
-		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
-	}
-
-	observacion := Observaciones{
-		Fecha_actualizacion: req.Fecha,
-		Diagnostico:         req.Diagnostico,
-	}
-	expediente, err := s.db.Get("Expedientes", []byte(string(req.ID)))
+	expediente, err := s.db.Get("Expedientes", []byte(string(req.Form.Get("id"))))
 
 	if err != nil {
-		return api.Response{Success: -1, Message: "No existe un expediente con DNI: %"}
+		return api.Response{Success: -1, Message: "No existe un expediente con ID: %"}
 	}
-	var expedienteStruct Expediente
+	var expedienteStruct api.Expediente
 	errStruct := json.Unmarshal(expediente, &expedienteStruct)
 
 	if errStruct != nil {
@@ -465,11 +445,12 @@ func (s *server) anyadirObservaciones(req api.Request) api.Response {
 	observaciones_originales := expedienteStruct.Observaciones
 
 	observaciones := append(observaciones_originales, observacion)
-	expedienteModificado := Expediente{
-		Medico:         req.Username,
-		Observaciones:  observaciones,
-		Fecha_creacion: expedienteStruct.Fecha_creacion,
-		Especialidad:   expedienteStruct.Especialidad,
+	expedienteModificado := api.Expediente{
+		ID:            expedienteStruct.ID,
+		Username:      req.Form.Get("username"),
+		Observaciones: observaciones,
+		FechaCreacion: expedienteStruct.FechaCreacion,
+		Especialidad:  expedienteStruct.Especialidad,
 	}
 
 	expedienteModificadoJson, errJson := json.Marshal(expedienteModificado)
@@ -477,58 +458,66 @@ func (s *server) anyadirObservaciones(req api.Request) api.Response {
 	if errJson != nil {
 		return api.Response{Success: -1, Message: "Error al convertir expediente a Json"}
 	}
-	s.db.Put("Expedientes", []byte(string(req.ID)), []byte(expedienteModificadoJson))
-
+	s.db.Put("Expedientes", []byte(string(req.Form.Get("id"))), []byte(expedienteModificadoJson))
+	fmt.Println("Expediente modificado correctamente")
 	return api.Response{Success: 1, Message: "Expediente modificado correctamente"}
 }
 
-func (s *server) anyadirExpediente(req api.Request) api.Response {
-	if req.Username == "" || req.Diagnostico == "" || req.DNI == "" || req.Token.Value == "" {
+func (s *server) anyadirExpediente(req *http.Request) api.Response {
+	if req.Form.Get("username") == "" || req.Form.Get("diagnostico") == "" || req.Form.Get("dni") == "" || req.Form.Get("token") == "" {
 		return api.Response{Success: -1, Message: "Faltan credenciales para añadir expedientes"}
 	}
 
-	if !s.isTokenValid(req.Token, req.Username) {
+	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	if !ok {
 		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
 	}
 
-	fecha := time.Now()
-	fechaStr := fecha.Format(time.DateOnly)
+	fecha := time.Now().Format("2006-01-02")
 
-	var observaciones []Observaciones
-
-	observacion := Observaciones{
-		Fecha_actualizacion: fechaStr,
-		Diagnostico:         req.Diagnostico,
-		Medico:              req.Username,
-	}
-	ultimoId := s.obtenerUltimoID("Expedientes")
-	observaciones = append(observaciones, observacion)
-
-	expediente := Expediente{
-		Medico:         req.Username,
-		Observaciones:  observaciones,
-		Fecha_creacion: fechaStr,
-		Especialidad:   currentSpecialty,
+	ultimoId, err := s.obtenerUltimoID("Expedientes")
+	if err != nil {
+		return api.Response{Success: -1, Message: "Error al generar ID de expediente"}
 	}
 
-	expedieteJson, errJson := json.Marshal(expediente)
+	ultimoIdInt, err := strconv.Atoi(ultimoId)
+	if err != nil {
+		return api.Response{Success: -1, Message: "Error en formato de ID"}
+	}
+
+	expediente := api.Expediente{
+		ID:       ultimoId,
+		Username: req.Form.Get("username"),
+		Observaciones: []api.Observaciones{
+			{
+				Fecha_actualizacion: fecha,
+				Diagnostico:         req.Form.Get("diagnostico"),
+				Medico:              req.Form.Get("username"),
+			},
+		},
+		FechaCreacion: fecha,
+		Especialidad:  currentSpecialty,
+	}
+	expedienteJson, errJson := json.Marshal(expediente)
 	if errJson != nil {
 		return api.Response{Success: -1, Message: "Error convirtiendo a json el expediente"}
 	}
 
-	s.db.Put("Expedientes", []byte(ultimoId), []byte(expedieteJson))
+	if err := s.db.Put("Expedientes", []byte(ultimoId), expedienteJson); err != nil {
+		return api.Response{Success: -1, Message: "Error guardando expediente"}
+	}
 
-	historialPaciente, errget := s.db.Get("Historiales", []byte(string(req.DNI)))
+	historialPaciente, errget := s.db.Get("Historiales", []byte(string(req.Form.Get("dni"))))
 	if errget != nil {
 		return api.Response{Success: -1, Message: "Error al obtener el historial del paciente"}
 	}
 
-	var historialSruct Historial
-	errStructHistorial := json.Unmarshal(historialPaciente, &historialSruct)
+	var historialStruct Historial
+	errStructHistorial := json.Unmarshal(historialPaciente, &historialStruct)
 	if errStructHistorial != nil {
 		return api.Response{Success: -1, Message: "Error al convertir el historial a struct"}
 	}
-	expedientesOriginales := historialSruct.Expedientes
+	expedientesOriginales := historialStruct.Expedientes
 
 	ultimoIdInt, erratoi := strconv.Atoi(ultimoId)
 	if erratoi != nil {
@@ -536,8 +525,20 @@ func (s *server) anyadirExpediente(req api.Request) api.Response {
 	}
 	expedientes := append(expedientesOriginales, ultimoIdInt)
 
+	found := false
+	for _, id := range historialStruct.Expedientes {
+		if id == ultimoIdInt {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		historialStruct.Expedientes = append(historialStruct.Expedientes, ultimoIdInt)
+	}
+
 	nuevoHistorial := Historial{
-		Fecha_creacion: fechaStr,
+		Fecha_creacion: fecha,
 		Expedientes:    expedientes,
 	}
 
@@ -546,23 +547,26 @@ func (s *server) anyadirExpediente(req api.Request) api.Response {
 		return api.Response{Success: -1, Message: "Error al convertir el historial en json"}
 	}
 
-	s.db.Put("Historiales", []byte(req.DNI), []byte(nuevoHistorialJson))
+	if err := s.db.Put("Historiales", []byte(req.Form.Get("dni")), nuevoHistorialJson); err != nil {
+		return api.Response{Success: -1, Message: "Error al guardar historial actualizado"}
+	}
 
 	return api.Response{Success: 1, Message: "Expediente creado y añadido al historial correctamente"}
 }
 
 // logoutUser borra la sesión en 'sessions', invalidando el token.
-func (s *server) logoutUser(req api.Request) api.Response {
+func (s *server) logoutUser(req *http.Request) api.Response {
 	// Chequeo de credenciales
-	if req.Username == "" || req.Token.Value == "" {
+	if req.Form.Get("username") == "" || req.Form.Get("token") == "" {
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
-	if !s.isTokenValid(req.Token, req.Username) {
+	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	if !ok {
 		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
 	}
 
-	// Borramos la entrada en 'sessions'
-	if err := s.db.Delete("sessions", []byte(req.Username)); err != nil {
+	// YA NO HACE FALTA
+	if err := s.db.Delete("sessions", []byte(req.Form.Get("username"))); err != nil {
 		return api.Response{Success: -1, Message: "Error al cerrar sesión"}
 	}
 
@@ -586,18 +590,72 @@ func (s *server) userExists(username string) (bool, error) {
 	return true, nil
 }
 
-func (s *server) isTokenValid(token api.Token, username string) bool {
-	tokenUser, err := s.db.Get("sessions", []byte(username))
-	if err != nil {
-		return false
+func getSecretoJwt() []byte {
+	return []byte("mi-secreto")
+}
+
+func crearToken(usuario string, minutos int) string {
+	//Tiempo de expiración
+	Hours := 0
+	Mins := minutos
+	Sec := 0
+
+	Claim := Payload{
+		usuario,
+		time.Now().Local().Add(
+			time.Hour*time.Duration(Hours) +
+				time.Minute*time.Duration(Mins) +
+				time.Second*time.Duration(Sec)).Unix(),
 	}
 
-	var tokenComprobar api.Token
-	errJSon := json.Unmarshal(tokenUser, &tokenComprobar)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, Claim)
 
-	if errJSon != nil || !time.Now().Before(token.ExpiresAt) || token.Value != tokenComprobar.Value {
-		return false
+	mySecret := getSecretoJwt()
+	signedToken, err := token.SignedString(mySecret)
+	chk(err)
+
+	return signedToken
+}
+
+func isTokenValid(receivedToken string, username string) (*Payload, bool) {
+	token, _ := jwt.ParseWithClaims(receivedToken, &Payload{}, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Methodo de firma erroneo: %v", token.Header["alg"])
+		}
+
+		return getSecretoJwt(), nil
+	})
+
+	claim, ok := token.Claims.(*Payload)
+	fmt.Println(claim.Id)
+	if ok && token.Valid {
+		return claim, true
 	}
 
-	return true
+	if claim.Id != username {
+		return claim, false
+	}
+
+	return claim, false
+}
+
+type Payload struct {
+	Id        string `json:"jti,omitempty"`
+	ExpiresAt int64  `json:"exp,omitempty"`
+}
+
+func (c Payload) Valid() error {
+	vErr := new(jwt.ValidationError)
+	now := jwt.TimeFunc().Unix()
+
+	if now > c.ExpiresAt {
+		delta := time.Unix(now, 0).Sub(time.Unix(c.ExpiresAt, 0))
+		vErr.Inner = fmt.Errorf("token is expired by %v", delta)
+		vErr.Errors |= jwt.ValidationErrorExpired
+
+		return vErr
+	} else {
+		return nil
+	}
+
 }

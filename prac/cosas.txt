@@ -50,3 +50,10 @@ COSAS QUE HACER:
 revisar que la ver expedientes funcione
 jwt 
 cifrado base datos
+
+SOLUCIONAR:
+-HACER CRIFRADO
+-HACER DOBLE AUTENTICACIÓN
+-HACER CERTIFICADO PROPIO
+-USAR CLAVE PÚBLICA
+
