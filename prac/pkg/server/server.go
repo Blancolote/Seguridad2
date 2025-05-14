@@ -6,13 +6,16 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"prac/pkg/api"
 	"sync"
 
@@ -113,52 +116,118 @@ func (s *server) comprobarHospEsp(namespace string, id int) bool {
 
 // Run inicia la base de datos y arranca el servidor HTTP.
 func Run() error {
-	err := godotenv.Load()
-	if err != nil {
-		fmt.Printf("No se puede cargar la variable de entorno desde un archivo .env: %v\n", err)
+	// Importaciones necesarias (añadir al inicio del archivo)
+	// import "crypto/sha256"
+	// import "encoding/hex"
+
+	//Crear directorio de logs si no existe
+	logDir := "logs"
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		fmt.Printf("Error creando directorio de logs: %v\n", err)
+		return err
 	}
+	currentTime := time.Now().Format("2006-01-02")
+	logFileName := filepath.Join(logDir, fmt.Sprintf("server_%s.log", currentTime))
+	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("Error abriendo archivo de log: %v\n", err)
+		return err
+	}
+
+	serverLogger := log.New(logFile, "[srv] ", log.LstdFlags|log.Lmicroseconds)
+	serverLogger.Println("**************************************************************************************************")
+	serverLogger.Println("Iniciando servidor...")
+	serverLogger.Println("Cargando variables de entorno...")
+
+	errEnv := godotenv.Load()
+
+	if errEnv != nil {
+		serverLogger.Printf("ADVERTENCIA: No se puede cargar la variable de entorno desde un archivo .env: %v", errEnv)
+	}
+
 	CryptoKey = os.Getenv("MASTER_PASSWORD")
 
 	if CryptoKey == "" {
+		serverLogger.Fatalf("ERROR: La variable de entorno MASTER_PASSWORD no está definida.")
 		return fmt.Errorf("no se ha definido la variable de entorno MASTER_PASSWORD")
 	}
 
+	// Verificar el hash de la clave maestra
+	// IMPORTANTE: Reemplaza este hash con el de tu clave real
+	expectedHash := "cb40ccb092951d4020ff31ad61f98e9dfb1de873517d6d0408ba23ee261bf1ff" // Hash ejemplo
+
+	// Calcular hash de la clave proporcionada
+	hasher := sha256.New()
+	hasher.Write([]byte(CryptoKey))
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+
+	// Comparar hashes
+	if actualHash != expectedHash {
+		serverLogger.Fatalf("ERROR: La clave maestra proporcionada no coincide con la esperada. Verificar MASTER_PASSWORD")
+		return fmt.Errorf("clave maestra incorrecta")
+	}
+
+	serverLogger.Println("MASTER_PASSWORD validada correctamente.")
+
 	db, err := store.NewStore("bbolt", "data/server.db")
 	if err != nil {
+		serverLogger.Fatalf("ERROR: error abriendo base de datos: %v", err)
 		return fmt.Errorf("error abriendo base de datos: %v", err)
 	}
 
 	srv := &server{
 		db:  db,
-		log: log.New(os.Stdout, "[srv] ", log.LstdFlags),
+		log: serverLogger,
 	}
 
-	// Al terminar, cerramos la base de datos (esto cifrará el archivo)
+	// Al terminar, cerramos la base de datos y el archivo log
 	defer func() {
-		fmt.Println("Cerrando y cifrando la base de datos...")
 		if err := srv.db.Close(); err != nil {
-			fmt.Printf("Error al cerrar la base de datos: %v\n", err)
+			srv.log.Fatalf("ERROR al cerrar la base de datos: %v", err)
 		} else {
-			fmt.Println("Base de datos cerrada y cifrada correctamente")
+			srv.log.Println("Base de datos cerrada y cifrada correctamente.")
+		}
+		fmt.Println("Cerrando archivo de log...")
+		if err := logFile.Close(); err != nil {
+			srv.log.Fatalf("Error al cerrar archivo de log: %v\n", err)
 		}
 	}()
 
 	// El resto del código continúa igual...
 	http.HandleFunc("/", srv.handler)
-	fmt.Println("Iniciando servidor HTTPS en puerto 10443...")
-	chk(http.ListenAndServeTLS(":10443", "cert.pem", "key.pem", nil))
+	srv.log.Println("Iniciando servidor HTTPS en puerto 10443...")
+	fmt.Printf("\nLogs del servidor se escriben en: %s\n", logFileName)
 
-	return err
+	if err := http.ListenAndServeTLS(":10443", "cert.pem", "key.pem", nil); err != nil {
+		srv.log.Fatalf("FATAL: Error al iniciar servidor HTTPS: %v", err)
+		return err
+	}
+
+	return nil
 }
 
 // apiHandler descodifica la solicitud JSON, la despacha
 // a la función correspondiente y devuelve la respuesta JSON.
 func (s *server) handler(w http.ResponseWriter, req *http.Request) {
 
+	ip := req.RemoteAddr
+	if forwardedFor := req.Header.Get("X-Forwarded-For"); forwardedFor != "" {
+		ip = forwardedFor
+	}
+
 	req.ParseForm()
 	w.Header().Set("Content-Type", "application/json")
 
-	switch req.Form.Get("cmd") {
+	cmd := req.Form.Get("cmd")
+	username := req.Form.Get("username")
+
+	// Registrar solicitud entrante
+	s.log.Printf("Solicitud recibida: IP=%s, Método=%s, Ruta=%s, Comando=%s, Usuario=%s",
+		ip, req.Method, req.URL.Path, cmd, username)
+
+	var res api.Response
+
+	switch cmd {
 	case "register":
 		res := s.registerUser(req)
 		response(w, res)
@@ -183,7 +252,15 @@ func (s *server) handler(w http.ResponseWriter, req *http.Request) {
 	case "verifyTOTP":
 		res := s.verifyTOTP(req)
 		response(w, res)
+	default:
+		s.log.Printf("Comando desconocido recibido: %s desde IP %s", cmd, ip)
+		res := api.Response{Success: -1, Message: fmt.Sprintf("Comando desconocido: %s", cmd)}
+		response(w, res)
 	}
+
+	s.log.Printf("Respuesta enviada para comando '%s' (Usuario: %s): Success=%d",
+		cmd, username, res.Success)
+
 }
 
 func (s *server) obtenerUltimoID(namespace string) (string, error) {
@@ -275,14 +352,7 @@ func (s *server) tryDecrypt(data []byte) ([]byte, error) {
 		return decryptedData, nil
 	}
 
-	// Si falla, intentamos sin compresión
-	decryptedData, err = cifrado.DecryptData(data, CryptoKey, CryptoAlgorithm, false)
-	if err == nil {
-		return decryptedData, nil
-	}
-
-	// Si aún falla, probamos con otros algoritmos comunes
-	for _, algo := range []string{"AES128", "AES256", "BLOWFISH", "TWOFISH"} {
+	for _, algo := range []string{"AES256"} {
 		if algo == CryptoAlgorithm {
 			continue // Ya lo probamos
 		}
@@ -294,19 +364,12 @@ func (s *server) tryDecrypt(data []byte) ([]byte, error) {
 			return decryptedData, nil
 		}
 
-		// También sin compresión
-		decryptedData, err = cifrado.DecryptData(data, CryptoKey, algo, false)
-		if err == nil {
-			fmt.Printf("Datos descifrados con algoritmo alternativo sin compresión: %s", algo)
-			return decryptedData, nil
-		}
 	}
 
 	// Si nada funciona, asumimos que los datos no están cifrados
 	return data, nil
 }
 
-// función para decodificar de string a []bytes (Base64)
 func decode64(s string) []byte {
 	b, err := base64.StdEncoding.DecodeString(s) // recupera el formato original
 	chk(err)                                     // comprobamos el error
@@ -460,6 +523,7 @@ func (s *server) recordLoginSuccess(username string) {
 func (s *server) loginUser(req *http.Request) api.Response {
 	// Verificar credenciales básicas
 	if req.Form.Get("username") == "" || req.Form.Get("password") == "" {
+		s.log.Println("Faltan credenciales en el login")
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
 
@@ -470,6 +534,7 @@ func (s *server) loginUser(req *http.Request) api.Response {
 	if !canLogin {
 		// Formatear tiempo restante de bloqueo
 		remaining := blockedUntil.Sub(time.Now()).Round(time.Minute)
+		s.log.Printf("Cuenta de %s bloqueada temporalmente. Intentar nuevamente en %v minutos", username, remaining)
 		return api.Response{
 			Success: -2,
 			Message: fmt.Sprintf("Cuenta bloqueada temporalmente. Intente nuevamente en %v minutos",
@@ -482,6 +547,7 @@ func (s *server) loginUser(req *http.Request) api.Response {
 	if err != nil {
 		// Registrar intento fallido - usuario no encontrado
 		s.recordLoginFailure(username, req)
+		s.log.Printf("Usuario no encontrado: %s", username)
 		return api.Response{Success: -1, Message: "Usuario no encontrado"}
 	}
 
@@ -495,6 +561,7 @@ func (s *server) loginUser(req *http.Request) api.Response {
 		decryptedData, err := s.tryDecrypt(userData)
 		if err != nil {
 			s.recordLoginFailure(username, req)
+			s.log.Println("Error descifrando datos del usuario")
 			return api.Response{Success: -1, Message: "Error descifrando datos de usuario"}
 		}
 
@@ -502,6 +569,7 @@ func (s *server) loginUser(req *http.Request) api.Response {
 		err = json.Unmarshal(decryptedData, &datosUsuario)
 		if err != nil {
 			s.recordLoginFailure(username, req)
+			s.log.Printf("Formato de datos de usuario inválido")
 			return api.Response{Success: -1, Message: "Formato de datos de usuario inválido"}
 		}
 	}
@@ -513,6 +581,7 @@ func (s *server) loginUser(req *http.Request) api.Response {
 	if bytes.Compare(datosUsuario.Hash, hash) != 0 {
 		// Contraseña incorrecta - registrar intento fallido
 		s.recordLoginFailure(username, req)
+		s.log.Printf("Contraseña introducida en el login incorrecta")
 		return api.Response{Success: -1, Message: "Contraseña incorrecta"}
 	}
 
@@ -520,7 +589,8 @@ func (s *server) loginUser(req *http.Request) api.Response {
 	s.recordLoginSuccess(username)
 
 	// Generar token y continuar con el proceso de login
-	token := crearToken(username, 10)
+	token := s.crearToken(username, 10)
+	s.log.Printf("Token generado para el usuario %s", username)
 
 	currentSpecialty = datosUsuario.Especialidad
 	currentHospital = datosUsuario.Hospital
@@ -530,7 +600,7 @@ func (s *server) loginUser(req *http.Request) api.Response {
 	if forwardedFor := req.Header.Get("X-Forwarded-For"); forwardedFor != "" {
 		ip = forwardedFor
 	}
-	s.log.Printf("Login exitoso para usuario %s desde IP %s", username, ip)
+	s.log.Printf("--------------------Login exitoso para usuario %s desde IP %s-------------------", username, ip)
 
 	return api.Response{Success: 1, Message: "Login exitoso", Token: token, TokenOTP: req.Form.Get("username")}
 }
@@ -538,16 +608,19 @@ func (s *server) loginUser(req *http.Request) api.Response {
 // Obtener expedientes de la especialidad del médico
 func (s *server) obtenerExpedientes(req *http.Request) api.Response {
 	if req.Form.Get("dni") == "" || req.Form.Get("token") == "" {
+		s.log.Println("Faltan datos a introducir para obtener expedientes")
 		return api.Response{Success: -1, Message: "Faltan datos"}
 	}
-	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	_, ok := s.isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
 	if !ok {
+		s.log.Println("Token caducado o inválido en obtener expedientes")
 		return api.Response{Success: 0, Message: "Error en las credenciales: Token inválido o caducado"}
 	}
 
 	// Obtener historial (potencialmente cifrado)
 	historialData, err_hist := s.db.Get("Historiales", []byte(req.Form.Get("dni")))
 	if err_hist != nil {
+		s.log.Println("El DNI introducido no es correcto en obtener expedientes")
 		return api.Response{Success: -1, Message: "El Dni introducido es incorrecto"}
 	}
 
@@ -560,12 +633,14 @@ func (s *server) obtenerExpedientes(req *http.Request) api.Response {
 		// Intentar descifrar
 		decryptedData, err := s.tryDecrypt(historialData)
 		if err != nil {
+			s.log.Println("Error descifrando el historial")
 			return api.Response{Success: -1, Message: "Error descifrando historial: " + err.Error()}
 		}
 
 		// Deserializar datos descifrados
 		err = json.Unmarshal(decryptedData, &historial_json)
 		if err != nil {
+			s.log.Println("Error decodificando el historial")
 			return api.Response{Success: -1, Message: "Error decodificando historial"}
 		}
 	}
@@ -574,11 +649,11 @@ func (s *server) obtenerExpedientes(req *http.Request) api.Response {
 	var info_expedientes [][]byte
 
 	for i := 0; i < len(lista_expedientes); i++ {
-		expedienteKey := strconv.Itoa(lista_expedientes[i]) // Convertir int a string
+		expedienteKey := strconv.Itoa(lista_expedientes[i])
 
-		// Obtener expediente (potencialmente cifrado)
 		expedienteData, errExp := s.db.Get("Expedientes", []byte(expedienteKey))
 		if errExp != nil {
+			s.log.Println("Los expedientes del paciente son incorrectos")
 			return api.Response{Success: -1, Message: "Los expedientes del paciente son incorrectos"}
 		}
 
@@ -586,38 +661,40 @@ func (s *server) obtenerExpedientes(req *http.Request) api.Response {
 		var expedienteStruct api.Expediente
 		err = json.Unmarshal(expedienteData, &expedienteStruct)
 
-		// Si falla, intentar descifrar
 		if err != nil {
 			// Intentar descifrar
 			decryptedData, err := s.tryDecrypt(expedienteData)
 			if err != nil {
+				s.log.Println("Error descifrando expediente")
 				return api.Response{Success: -1, Message: "Error descifrando expediente: " + err.Error()}
 			}
 
-			// Usar los datos descifrados
 			info_expedientes = append(info_expedientes, decryptedData)
+
 		} else {
-			// Si se deserializó correctamente, usar los datos originales
 			info_expedientes = append(info_expedientes, expedienteData)
 		}
 	}
-
+	s.log.Println("Expedientes obtenidos")
 	return api.Response{Success: 1, Message: "Expedientes obtenidos", Expedientes: info_expedientes}
 }
 
 func (s *server) addPaciente(req *http.Request) api.Response {
 
 	if req.Form.Get("dni") == "" || req.Form.Get("nom_Paciente") == "" || req.Form.Get("apellido") == "" || req.Form.Get("fecha") == "" || req.Form.Get("username") == "" || req.Form.Get("sexo") == "" || req.Form.Get("token") == "" {
+		s.log.Println("Faltan datos del paciente al añadir un paciente")
 		return api.Response{Success: -1, Message: "Faltan datos del paciente"}
 	}
 
-	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	_, ok := s.isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
 	if !ok {
+		s.log.Printf("Token inválido o caducado en añadir paciente del usuario %s", req.Form.Get("username"))
 		return api.Response{Success: 0, Message: "Error en las credenciales: Token inválido o caducado"}
 	}
 
 	_, errDNI := s.db.Get("Pacientes", []byte(req.Form.Get("dni")))
 	if errDNI == nil {
+		s.log.Printf("El paciente %s ya existe.", req.Form.Get("nom_Paciente"))
 		return api.Response{Success: -1, Message: "El paciente ya existe"}
 	}
 
@@ -632,12 +709,14 @@ func (s *server) addPaciente(req *http.Request) api.Response {
 	historial_json, errJsonHist := json.Marshal(historial)
 
 	if errJsonHist != nil {
-		return api.Response{Success: -1, Message: "Error creando json de historial"}
+		s.log.Println("Error creando json del historial")
+		return api.Response{Success: -1, Message: "Error creando json del historial"}
 	}
 
 	errHist := s.db.Put("Historiales", []byte(req.Form.Get("dni")), []byte(historial_json))
 
 	if errHist != nil {
+		s.log.Println("Error creando historial en la base de datos")
 		return api.Response{Success: -1, Message: "Error creando historial en la base de datos"}
 	}
 
@@ -654,36 +733,42 @@ func (s *server) addPaciente(req *http.Request) api.Response {
 	paciente_json, errJson := json.Marshal(paciente)
 
 	if errJson != nil {
+		s.log.Printf("No se pueden convertir los datos del paciente %s a json", req.Form.Get("nom_Paciente"))
 		return api.Response{Success: -1, Message: "No pueden convertirse los datos a json"}
 	}
 
 	encryptedData, err := cifrado.EncryptData(paciente_json, CryptoKey, CryptoAlgorithm, CryptoCompression)
 	if err != nil {
+		s.log.Println("Error cifrando datos del paciente")
 		return api.Response{Success: -1, Message: "Error cifrando datos del paciente: " + err.Error()}
 	}
 
 	err1 := s.db.Put("Pacientes", []byte(req.Form.Get("dni")), []byte(encryptedData))
 
 	if err1 != nil {
+		s.log.Println("Error creando al paciente")
 		return api.Response{Success: -1, Message: "Error creando al paciente"}
 	}
-
-	return api.Response{Success: 1, Message: "Usuario creado"}
+	s.log.Printf("Paciente creado")
+	return api.Response{Success: 1, Message: "Paciente creado"}
 }
 
 func (s *server) anyadirObservaciones(req *http.Request) api.Response {
 	if req.Form.Get("username") == "" || req.Form.Get("token") == "" || req.Form.Get("fecha") == "" || req.Form.Get("diagnostico") == "" || req.Form.Get("id") == "" || req.Form.Get("tratamiento") == "" {
+		s.log.Println("Faltan credenciales en añadir observaciones")
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
 
-	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	_, ok := s.isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
 	if !ok {
+		s.log.Printf("Token inválido o caducado del usuario %s en añadir observaciones", req.Form.Get("username"))
 		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
 	}
 
 	// Obtener el expediente existente
 	expedienteData, err := s.db.Get("Expedientes", []byte(string(req.Form.Get("id"))))
 	if err != nil {
+		s.log.Printf("No existen un expediente con el id %v", req.Form.Get("id"))
 		return api.Response{Success: -1, Message: "No existe un expediente con ID: " + req.Form.Get("id")}
 	}
 
@@ -696,12 +781,14 @@ func (s *server) anyadirObservaciones(req *http.Request) api.Response {
 		// Intentar descifrar
 		decryptedData, err := s.tryDecrypt(expedienteData)
 		if err != nil {
+			s.log.Println("Error descifrando el expediente")
 			return api.Response{Success: -1, Message: "Error descifrando expediente: " + err.Error()}
 		}
 
 		// Deserializar datos descifrados
 		err = json.Unmarshal(decryptedData, &expedienteStruct)
 		if err != nil {
+			s.log.Println("Error al convertir a estructura el expediente")
 			return api.Response{Success: -1, Message: "Error al convertir a estructura el expediente: " + err.Error()}
 		}
 	}
@@ -729,18 +816,21 @@ func (s *server) anyadirObservaciones(req *http.Request) api.Response {
 	// Convertir a JSON
 	expedienteModificadoJson, errJson := json.Marshal(expedienteModificado)
 	if errJson != nil {
+		s.log.Println("Error al convertir expediente a JSON")
 		return api.Response{Success: -1, Message: "Error al convertir expediente a Json"}
 	}
 
 	// Cifrar el expediente
 	encryptedData, err := cifrado.EncryptData(expedienteModificadoJson, CryptoKey, CryptoAlgorithm, CryptoCompression)
 	if err != nil {
+		s.log.Println("Error cifrando el expediente")
 		return api.Response{Success: -1, Message: "Error cifrando expediente: " + err.Error()}
 	}
 
 	// Guardar el expediente cifrado
 	err = s.db.Put("Expedientes", []byte(string(req.Form.Get("id"))), encryptedData)
 	if err != nil {
+		s.log.Println("Error guardando el expediente")
 		return api.Response{Success: -1, Message: "Error guardando expediente: " + err.Error()}
 	}
 
@@ -750,11 +840,13 @@ func (s *server) anyadirObservaciones(req *http.Request) api.Response {
 
 func (s *server) anyadirExpediente(req *http.Request) api.Response {
 	if req.Form.Get("username") == "" || req.Form.Get("diagnostico") == "" || req.Form.Get("dni") == "" || req.Form.Get("token") == "" {
+		s.log.Println("Faltan credenciales al añadir expedientes")
 		return api.Response{Success: -1, Message: "Faltan credenciales para añadir expedientes"}
 	}
 
-	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	_, ok := s.isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
 	if !ok {
+		s.log.Printf("Token inválido o caducado en añadir expedientes del usuario %s", req.Form.Get("username"))
 		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
 	}
 
@@ -762,11 +854,13 @@ func (s *server) anyadirExpediente(req *http.Request) api.Response {
 
 	ultimoId, err := s.obtenerUltimoID("Expedientes")
 	if err != nil {
+		s.log.Println("Error al generar ID del expediente")
 		return api.Response{Success: -1, Message: "Error al generar ID de expediente"}
 	}
 
 	ultimoIdInt, err := strconv.Atoi(ultimoId)
 	if err != nil {
+		s.log.Println("Error en el formato del ID")
 		return api.Response{Success: -1, Message: "Error en formato de ID"}
 	}
 
@@ -788,23 +882,27 @@ func (s *server) anyadirExpediente(req *http.Request) api.Response {
 	// Convertir a JSON
 	expedienteJSON, errJson := json.Marshal(expediente)
 	if errJson != nil {
+		s.log.Println("Error convirtiendo a JSON el expediente")
 		return api.Response{Success: -1, Message: "Error convirtiendo a json el expediente"}
 	}
 
 	// Cifrar datos del expediente
 	encryptedExpediente, err := cifrado.EncryptData(expedienteJSON, CryptoKey, CryptoAlgorithm, CryptoCompression)
 	if err != nil {
+		s.log.Println("Error cifrando el expediente")
 		return api.Response{Success: -1, Message: "Error cifrando expediente: " + err.Error()}
 	}
 
 	// Guardar expediente cifrado
 	if err := s.db.Put("Expedientes", []byte(ultimoId), encryptedExpediente); err != nil {
+		s.log.Println("Error guardando el expediente")
 		return api.Response{Success: -1, Message: "Error guardando expediente"}
 	}
 
 	// Ahora actualizamos el historial del paciente
 	historialData, errget := s.db.Get("Historiales", []byte(string(req.Form.Get("dni"))))
 	if errget != nil {
+		s.log.Println("Error al obtener el historial del paciente")
 		return api.Response{Success: -1, Message: "Error al obtener el historial del paciente"}
 	}
 
@@ -817,12 +915,14 @@ func (s *server) anyadirExpediente(req *http.Request) api.Response {
 		// Intentar descifrar
 		decryptedData, err := s.tryDecrypt(historialData)
 		if err != nil {
+			s.log.Println("Formato inválido del historial. Error al leer historial")
 			return api.Response{Success: -1, Message: "Error al leer historial: formato inválido"}
 		}
 
 		// Deserializar datos descifrados
 		err = json.Unmarshal(decryptedData, &historialStruct)
 		if err != nil {
+			s.log.Println("Error al convertir el historial a struct")
 			return api.Response{Success: -1, Message: "Error al convertir el historial a struct"}
 		}
 	}
@@ -849,20 +949,23 @@ func (s *server) anyadirExpediente(req *http.Request) api.Response {
 	// Convertir a JSON
 	historialJSON, errJson := json.Marshal(nuevoHistorial)
 	if errJson != nil {
+		s.log.Println("Erron al convertir el historial a JSON")
 		return api.Response{Success: -1, Message: "Error al convertir el historial en json"}
 	}
 
 	// Cifrar historial
 	encryptedHistorial, err := cifrado.EncryptData(historialJSON, CryptoKey, CryptoAlgorithm, CryptoCompression)
 	if err != nil {
+		s.log.Println("Error cifrando el historial")
 		return api.Response{Success: -1, Message: "Error cifrando historial: " + err.Error()}
 	}
 
 	// Guardar historial cifrado
 	if err := s.db.Put("Historiales", []byte(req.Form.Get("dni")), encryptedHistorial); err != nil {
+		s.log.Println("Error al guardar el historial actualizado")
 		return api.Response{Success: -1, Message: "Error al guardar historial actualizado"}
 	}
-
+	s.log.Println("Expediente creado y añadido al historial correctamente")
 	return api.Response{Success: 1, Message: "Expediente creado y añadido al historial correctamente"}
 }
 
@@ -870,18 +973,15 @@ func (s *server) anyadirExpediente(req *http.Request) api.Response {
 func (s *server) logoutUser(req *http.Request) api.Response {
 	// Chequeo de credenciales
 	if req.Form.Get("username") == "" || req.Form.Get("token") == "" {
+		s.log.Println("Faltan credenciales en cerrar sesión")
 		return api.Response{Success: -1, Message: "Faltan credenciales"}
 	}
-	_, ok := isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
+	_, ok := s.isTokenValid(req.Form.Get("token"), req.Form.Get("username"))
 	if !ok {
+		s.log.Println("Token inválido o caducado en cerrar sesión")
 		return api.Response{Success: 0, Message: "Token inválido o sesión expirada"}
 	}
-
-	// YA NO HACE FALTA
-	if err := s.db.Delete("sessions", []byte(req.Form.Get("username"))); err != nil {
-		return api.Response{Success: -1, Message: "Error al cerrar sesión"}
-	}
-
+	s.log.Println("Sesión cerrada correctamente")
 	return api.Response{Success: 1, Message: "Sesión cerrada correctamente"}
 }
 
@@ -902,11 +1002,23 @@ func (s *server) userExists(username string) (bool, error) {
 	return true, nil
 }
 
-func getSecretoJwt() []byte {
-	return []byte("mi-secreto")
+func (s *server) getSecretoJwt() []byte {
+	errEnv := godotenv.Load()
+
+	if errEnv != nil {
+		s.log.Printf("ADVERTENCIA: No se puede cargar la variable de entorno desde un archivo .env: %v", errEnv)
+	}
+
+	secreto := os.Getenv("MASTER_PASSWORD_JWT")
+
+	if secreto == "" {
+		s.log.Fatalf("ERROR: La variable de entorno MASTER_PASSWORD_JWT no está definida.")
+
+	}
+	return []byte(secreto)
 }
 
-func crearToken(usuario string, minutos int) string {
+func (s *server) crearToken(usuario string, minutos int) string {
 	//Tiempo de expiración
 	Hours := 0
 	Mins := minutos
@@ -922,20 +1034,21 @@ func crearToken(usuario string, minutos int) string {
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, Claim)
 
-	mySecret := getSecretoJwt()
+	mySecret := s.getSecretoJwt()
 	signedToken, err := token.SignedString(mySecret)
 	chk(err)
 
 	return signedToken
 }
 
-func isTokenValid(receivedToken string, username string) (*Payload, bool) {
+func (s *server) isTokenValid(receivedToken string, username string) (*Payload, bool) {
 	token, _ := jwt.ParseWithClaims(receivedToken, &Payload{}, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			s.log.Fatalf("Methodo de firma erroneo: %v", token.Header["alg"])
 			return nil, fmt.Errorf("Methodo de firma erroneo: %v", token.Header["alg"])
 		}
 
-		return getSecretoJwt(), nil
+		return s.getSecretoJwt(), nil
 	})
 
 	claim, ok := token.Claims.(*Payload)
@@ -976,11 +1089,9 @@ func (s *server) verifyTOTP(req *http.Request) api.Response {
 	username := req.Form.Get("username")
 	code := req.Form.Get("code")
 
-	if username == "" || code == "" {
-		return api.Response{Success: -1, Message: "Faltan datos"}
-	}
 	userData, err := s.db.Get("Usuarios", []byte(username))
 	if err != nil {
+		s.log.Printf("Usuario %s no encontrado en la verificación ToTP", username)
 		return api.Response{Success: -1, Message: "Usuario no encontrado"}
 	}
 
@@ -988,16 +1099,19 @@ func (s *server) verifyTOTP(req *http.Request) api.Response {
 
 	var u user
 	if err := json.Unmarshal(userData, &u); err != nil {
+		s.log.Printf("Error procesando los datos del usuario en verificación de ToTP")
 		return api.Response{Success: -1, Message: "Error procesando datos del usuario"}
 	}
 
 	valid := totp.Validate(code, u.TOTPSecret)
 	if !valid {
-		return api.Response{Success: -1, Message: "Código TOTP inválido"}
+		s.log.Printf("Código ToTP inválido para el usuario %s", username)
+		return api.Response{Success: -1, Message: "\nCódigo TOTP inválido"}
 	}
 
 	// Generar token JWT final
-	token := crearToken(username, 30)
+	token := s.crearToken(username, 30)
+	s.log.Println("Autenticación TOTP exitosa")
 	return api.Response{
 		Success: 1,
 		Message: "Autenticación TOTP exitosa",

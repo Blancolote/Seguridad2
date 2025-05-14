@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/fatih/color"
 )
 
 // PrintMenu muestra un menú y solicita al usuario que seleccione una opción.
 func PrintMenu(title string, options []string) int {
-	fmt.Print(title, "\n\n")
+	color.Blue(title + "\n\n")
 	for i, option := range options {
 		fmt.Printf("%d. %s\n", i+1, option)
 	}
@@ -23,7 +25,7 @@ func PrintMenu(title string, options []string) int {
 		if err == nil && choice >= 1 && choice <= len(options) {
 			break
 		}
-		fmt.Println("Opción no válida, inténtalo de nuevo.")
+		color.Red("Opción no válida, inténtalo de nuevo.")
 		fmt.Print("Selecciona una opción: ")
 	}
 	return choice
@@ -49,7 +51,7 @@ func Confirm(message string) bool {
 		} else if response == "N" {
 			return false
 		}
-		fmt.Println("Respuesta no válida, introduce S o N.")
+		color.Red("Respuesta no válida, introduce S o N.")
 	}
 }
 
@@ -73,7 +75,7 @@ func ReadInt(prompt string) int {
 		if err == nil {
 			return value
 		}
-		fmt.Println("Valor no válido, introduce un número entero.")
+		color.Red("Valor no válido, introduce un número entero.")
 		bufio.NewScanner(os.Stdin).Scan()
 	}
 }

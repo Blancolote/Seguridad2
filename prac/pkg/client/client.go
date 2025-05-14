@@ -21,11 +21,13 @@ import (
 	"path/filepath"
 	"prac/pkg/api"
 	"prac/pkg/ui"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unicode"
 
+	"github.com/fatih/color"
 	"github.com/mdp/qrterminal"
 	"github.com/nsf/termbox-go"
 	"golang.org/x/term"
@@ -97,8 +99,24 @@ func encode64(data []byte) string {
 func Run() {
 	// Creamos un logger con prefijo 'cli' para identificar
 	// los mensajes en la consola.
+
+	logDir := "logs"
+	currentTime := time.Now().Format("2006-01-02")
+	logFileName := filepath.Join(logDir, fmt.Sprintf("client_%s.log", currentTime))
+	logFile, err := os.OpenFile(logFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+
+	if err != nil {
+		fmt.Printf("Error abriendo archivo de log: %v\n", err)
+		return
+	}
+
+	clientLogger := log.New(logFile, "[cli] ", log.LstdFlags|log.Lmicroseconds)
+	clientLogger.Println("**************************************************************************************************")
+	clientLogger.Println("Iniciando cliente...")
+	fmt.Printf("\nLogs del cliente se escriben en: %s\n", logFileName)
+
 	c := &client{
-		log: log.New(os.Stdout, "[cli] ", log.LstdFlags),
+		log: clientLogger,
 	}
 
 	tr := &http.Transport{
@@ -123,7 +141,8 @@ func (c *client) runLoop() {
 		if c.currentUser == "" {
 			title = "Menú"
 		} else {
-			title = fmt.Sprintf("Menú (%s)", c.currentUser)
+			title = "Menú (" + c.currentUser + ")"
+
 		}
 
 		// Generamos las opciones dinámicamente, según si hay un login activo.
@@ -179,7 +198,7 @@ func (c *client) runLoop() {
 		}
 
 		// Pausa para que el usuario vea resultados.
-		ui.Pause("Pulsa [Enter] para continuar...")
+		ui.Pause("\nPulsa [Enter] para continuar...")
 	}
 }
 
@@ -372,7 +391,7 @@ func drawString(x, y int, str string, fg, bg termbox.Attribute) {
 // Si el registro es exitoso, se intenta el login automático.
 func (c *client) registerUser() {
 	ui.ClearScreen()
-	fmt.Println("** Registro de usuario **")
+	color.Cyan("Registro de usuario\n")
 
 	// generamos un par de claves (privada, pública) para el servidor
 	pkClient, err := rsa.GenerateKey(rand.Reader, 1024)
@@ -407,9 +426,6 @@ func (c *client) registerUser() {
 		chk(err)
 	}
 
-	// Eliminar esta línea que muestra la contraseña en texto claro
-	// fmt.Print(password)
-
 	apellido := ui.ReadInput("Apellido")
 	especialidad := ui.ReadInput("ID de especialidad") //ID?
 	hospital := ui.ReadInput("ID de hospital")
@@ -432,6 +448,7 @@ func (c *client) registerUser() {
 
 	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
+	c.log.Printf("Enviando solicitud 'register' al servidor")
 
 	// Decodificar la respuesta JSON en lugar de solo imprimirla
 	var resp api.Response
@@ -441,7 +458,8 @@ func (c *client) registerUser() {
 	defer r.Body.Close()
 
 	if resp.Success == 1 {
-		fmt.Println("Registro exitoso.")
+		c.log.Println("Registro exitoso")
+		color.Green("Registro exitoso.")
 		if otpauth := resp.Data; otpauth != "" {
 			fmt.Printf("Configura TOTP en Google Authenticator usando este URI:\n%s\n", otpauth)
 
@@ -450,19 +468,19 @@ func (c *client) registerUser() {
 
 			fmt.Println("O introduce manualmente el secreto en la app (copiar desde el URI).")
 		} else {
-			fmt.Println("Error: No se recibió un secreto TOTP válido")
+			color.Red("Error: No se recibió un secreto TOTP válido")
 		}
 	} else {
-		fmt.Printf("Error: %s\n", resp.Message)
+		color.Red("\n" + resp.Message)
 	}
 }
 
 // loginUser pide credenciales y realiza un login en el servidor.
 func (c *client) loginUser() {
 	ui.ClearScreen()
-	fmt.Println("** Inicio de sesión **")
+	color.Cyan("Inicio de sesión\n")
 
-	username := ui.ReadInput("Nombre de usuario:")
+	username := ui.ReadInput("Nombre de usuario")
 	fmt.Print("Contraseña: ")
 	passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
 	chk(err)
@@ -483,6 +501,8 @@ func (c *client) loginUser() {
 	data.Set("password", encode64(keyLogin)) // contraseña (a base64 porque es []byte)
 	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
+	c.log.Printf("Enviando solicitud 'login' al servidor")
+
 	body, err := io.ReadAll(r.Body)
 	chk(err)
 
@@ -491,7 +511,6 @@ func (c *client) loginUser() {
 
 	if resp.Success == 1 {
 
-		fmt.Println(resp.Message)
 		code := ui.ReadInput("Introduce tu código TOTP")
 		data := url.Values{}
 		data.Set("cmd", "verifyTOTP")
@@ -500,6 +519,8 @@ func (c *client) loginUser() {
 
 		r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 		chk(err)
+		c.log.Printf("Enviando solicitud 'verifyTOTP' al servidor")
+
 		body, err := io.ReadAll(r.Body)
 		chk(err)
 
@@ -510,22 +531,26 @@ func (c *client) loginUser() {
 			c.currentUser = username
 			c.authToken = resp.Token
 			c.TokenOTP = resp.TokenOTP
-			fmt.Println("Message: ", resp.Message)
+			c.log.Println("Código OTP proporcionado es válido")
+			c.log.Printf("------------------------Login exitoso para el usuario %s---------------------------", username)
 			return
+		} else {
+			c.log.Println("Código OTP proporcionado no es válido")
 		}
 
 	}
 	if resp.Success == -1 {
-		fmt.Println(resp.Message)
+		c.log.Println("ERROR iniciando sesión")
+		color.Red(resp.Message)
 	}
 
 }
 
 func (c *client) verHistorialPaciente() {
 	ui.ClearScreen()
-	fmt.Println("** Ver historial del paciente **")
+	color.Cyan("Ver historial del paciente\n")
 
-	dni := ui.ReadInput("DNI del paciente: ")
+	dni := ui.ReadInput("DNI del paciente")
 
 	data := url.Values{}
 	data.Set("cmd", "verHistorialPaciente")
@@ -534,6 +559,8 @@ func (c *client) verHistorialPaciente() {
 	data.Set("dni", dni)
 	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
+	c.log.Printf("Enviando solicitud 'verHistorialPaciente' al servidor")
+
 	body, err := io.ReadAll(r.Body)
 	chk(err)
 
@@ -546,20 +573,22 @@ func (c *client) verHistorialPaciente() {
 	}
 
 	if resp.Success == -1 {
-		fmt.Println("Mensaje:", resp.Message)
+		c.log.Printf("ADVERTENCIA: el dni introducido: %s, no existe", dni)
+		color.Red(resp.Message)
 		if ui.Confirm("¿Desea dar de alta al paciente? (s/n)") {
 			c.darAltaPaciente()
 		}
 		return
 	}
 	c.currentDNI = dni // Guardamos el DNI actual
-
+	c.log.Println("DNI introducido es correcto")
 	c.menuExpedientes(dni)
 }
+
 func (c *client) menuExpedientes(dni string) {
 	for {
 		ui.ClearScreen()
-		fmt.Printf("Historial del paciente con DNI %s\n", dni)
+		color.Yellow("Historial del paciente con DNI " + dni + "\n")
 		data := url.Values{}
 		data.Set("cmd", "verHistorialPaciente")
 		data.Set("token", c.authToken)
@@ -579,7 +608,7 @@ func (c *client) menuExpedientes(dni string) {
 		}
 
 		if resp.Success != 1 {
-			fmt.Println("Error al obtener expedientes:", resp.Message)
+			color.Red("Error al obtener expedientes:", resp.Message)
 			break
 		}
 		// Mostrar opciones
@@ -604,10 +633,10 @@ func (c *client) menuExpedientes(dni string) {
 
 func (c *client) crearExpediente() {
 	ui.ClearScreen()
-	fmt.Println("** Crear nuevo expediente **")
+	color.Cyan("Crear nuevo expediente\n")
 
-	observaciones := ui.ReadInput("Observaciones: ")
-	tratamiento := ui.ReadInput("Tratamiento: ")
+	observaciones := ui.ReadInput("Observaciones")
+	tratamiento := ui.ReadInput("Tratamiento")
 	data := url.Values{}
 	data.Set("cmd", "crearExpediente")
 	data.Set("token", c.authToken)
@@ -617,6 +646,8 @@ func (c *client) crearExpediente() {
 	data.Set("tratamiento", tratamiento)
 	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
+	c.log.Printf("Enviando solicitud 'crearExpediente' al servidor")
+
 	body, err := io.ReadAll(r.Body)
 	chk(err)
 
@@ -628,42 +659,48 @@ func (c *client) crearExpediente() {
 		return
 	}
 
-	fmt.Println("Éxito:", resp.Success)
-	fmt.Println("Mensaje:", resp.Message)
-	ui.Pause("Pulsa [Enter] para continuar...")
+	if resp.Success == 1 {
+		c.log.Println("Expediente creado correctamente")
+		color.Green(resp.Message)
+	} else {
+		c.log.Println("ERROR AL CREAR EL EXPEDIENTE")
+		color.Red(resp.Message)
+	}
+
+	ui.Pause("\nPulsa [Enter] para continuar...")
 }
 
 func (c *client) darAltaPaciente() {
 	ui.ClearScreen()
-	fmt.Println("** Dar de alta al paciente **")
+	color.Cyan("Dar de alta al paciente\n")
 
-	nombre := ui.ReadInput("Nombre: ")
-	apellido := ui.ReadInput("Apellido: ")
+	nombre := ui.ReadInput("Nombre")
+	apellido := ui.ReadInput("Apellido")
 	var fecha_nacimiento string
 	for {
-		fecha_nacimiento = ui.ReadInput("Fecha de nacimiento (AAAA-dd-mm): ")
+		fecha_nacimiento = ui.ReadInput("Fecha de nacimiento (AAAA-dd-mm)")
 		_, err := time.Parse("2006-01-02", fecha_nacimiento) // Formato AAAA-DD-MM
 		if err == nil {
 			break
 		}
-		fmt.Println("Formato inválido. Usa AAAA-DD-MM (ejemplo: 1990-03-15)")
+		color.Red("Formato inválido. Usa AAAA-DD-MM (ejemplo: 1990-03-15)")
 	}
 	var dni string
 	for {
-		dni = ui.ReadInput("DNI del paciente: ")
+		dni = ui.ReadInput("DNI del paciente")
 		if validarDNI(dni) {
 			break
 		}
-		fmt.Println("DNI inválido. Debe tener 9 caracteres y terminar en una letra (ejemplo: 12345678A)")
+		color.Red("DNI inválido. Debe tener 9 caracteres y terminar en una letra (ejemplo: 12345678A)")
 	}
 	var sexo string
 	for {
-		sexo = strings.ToUpper(ui.ReadInput("Sexo (H,M,O): "))
+		sexo = strings.ToUpper(ui.ReadInput("Sexo (H,M,O)"))
 
 		if sexo == "H" || sexo == "M" || sexo == "O" {
 			break
 		}
-		fmt.Println("Sexo inválido. Debe ser H, M o O")
+		color.Red("Sexo inválido. Debe ser H, M o O")
 	}
 
 	data := url.Values{}
@@ -677,6 +714,8 @@ func (c *client) darAltaPaciente() {
 	data.Set("token", c.authToken)
 	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
+	c.log.Printf("Enviando solicitud 'addPaciente' al servidor")
+
 	body, err := io.ReadAll(r.Body)
 	chk(err)
 
@@ -686,15 +725,21 @@ func (c *client) darAltaPaciente() {
 	if resp.Success == 0 {
 		c.logoutUser()
 	}
-	fmt.Println("Éxito:", resp.Success)
-	fmt.Println("Mensaje:", resp.Message)
+
+	if resp.Success == 1 {
+		c.log.Println("Expediente creado correctamente")
+		color.Green(resp.Message)
+	} else {
+		c.log.Println("ERROR AL CREAR EL EXPEDIENTE")
+		color.Red(resp.Message)
+	}
 }
 
 // logoutUser llama a la acción logout en el servidor, y si es exitosa,
 // borra la sesión local (currentUser/authToken).
 func (c *client) logoutUser() {
 	ui.ClearScreen()
-	fmt.Println("** Cerrar sesión **")
+	color.Cyan("Cerrar sesión\n")
 
 	if c.currentUser == "" || c.authToken == "" {
 		fmt.Println("No estás logueado.")
@@ -707,19 +752,25 @@ func (c *client) logoutUser() {
 	data.Set("token", c.authToken)
 	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
+	c.log.Printf("Enviando solicitud 'logout' al servidor")
+
 	body, err := io.ReadAll(r.Body)
 	chk(err)
 
 	err = json.Unmarshal(body, &resp)
 	chk(err)
 
-	fmt.Println("Éxito:", resp.Success)
-	fmt.Println("Mensaje:", resp.Message)
+	fmt.Println(resp.Message + "\n")
 
 	// Si fue exitoso, limpiamos la sesión local.
 	if resp.Success == 1 {
 		c.currentUser = ""
 		c.authToken = ""
+		c.currentHospital = ""
+		c.currentHospital = ""
+		c.log.Println("Sesión cerrada correctamente")
+	} else {
+		c.log.Println("Error al cerrar la sesión")
 	}
 }
 
@@ -750,7 +801,7 @@ func validarDNI(dni string) bool {
 
 func (c *client) obtenerDNIPaciente() (string, error) {
 	for {
-		dni := ui.ReadInput("DNI del paciente: ")
+		dni := ui.ReadInput("DNI del paciente")
 		if validarDNI(dni) {
 			return dni, nil
 		}
@@ -761,7 +812,7 @@ func (c *client) obtenerDNIPaciente() (string, error) {
 func (c *client) mostrarExpedientes(expedientes [][]byte) {
 	for {
 		ui.ClearScreen()
-		fmt.Println("** Expedientes del paciente **")
+		color.Yellow("Expedientes del paciente \n")
 		var exp api.Expediente
 
 		uniqueExpedientes := make(map[string]bool)
@@ -820,7 +871,7 @@ func (c *client) mostrarExpedientes(expedientes [][]byte) {
 
 		if expedienteSeleccionado == nil {
 			fmt.Printf("No se encontró un expediente con ID %s\n", input)
-			ui.Pause("Pulsa [Enter] para continuar...")
+			ui.Pause("\nPulsa [Enter] para continuar...")
 			continue
 		}
 
@@ -840,8 +891,8 @@ func (c *client) gestionarExpediente(expedienteData []byte) {
 	}
 
 	if err := json.Unmarshal(expedienteData, &exp); err != nil {
-		fmt.Println("Error al procesar expediente:", err)
-		ui.Pause("Pulsa [Enter] para continuar...")
+		color.Red("Error al procesar expediente:", err)
+		ui.Pause("\nPulsa [Enter] para continuar...")
 		return
 	}
 
@@ -850,7 +901,7 @@ func (c *client) gestionarExpediente(expedienteData []byte) {
 		fmt.Printf("=== Expediente ID: %s ===\n", exp.ID)
 		fmt.Printf("Fecha creación: %s\n", exp.Fecha_creacion)
 		fmt.Printf("Médico responsable: %s\n", exp.Medico)
-		fmt.Println("\n=== Observaciones ===")
+		color.Yellow("\n=== Observaciones ===")
 
 		for i, obs := range exp.Observaciones {
 			fmt.Printf("%d. [%s] %s\n", i+1, obs.Fecha_actualizacion, truncate(obs.Diagnostico, 60))
@@ -860,37 +911,40 @@ func (c *client) gestionarExpediente(expedienteData []byte) {
 		fmt.Println("2. Añadir nueva observación")
 		fmt.Println("0. Volver")
 
-		opcion := ui.ReadInt("Seleccione una opción:")
+		opcion := ui.ReadInt("\nSeleccione una opción")
 
 		switch opcion {
 		case 0:
 			return
 		case 1:
 			if len(exp.Observaciones) == 0 {
-				fmt.Println("No hay observaciones disponibles")
-				ui.Pause("Pulsa [Enter] para continuar...")
+				color.Red("No hay observaciones disponibles")
+				ui.Pause("\nPulsa [Enter] para continuar...")
 				continue
 			}
 
-			numObs := ui.ReadInt("Ingrese el número de observación a ver:")
+			numObs := ui.ReadInt("Ingrese el número de observación a ver")
 			if numObs < 1 || numObs > len(exp.Observaciones) {
-				fmt.Println("Número de observación inválido")
-				ui.Pause("Pulsa [Enter] para continuar...")
+				c.log.Printf("Número de observaciones inválido: %v", numObs)
+				color.Red("\nNúmero de observación inválido")
+				ui.Pause("\n\nPulsa [Enter] para continuar...")
 				continue
 			}
 
 			obs := exp.Observaciones[numObs-1]
 			ui.ClearScreen()
-			fmt.Printf("=== Observación %d ===\n", numObs)
+			numObsString := strconv.Itoa(numObs)
+			color.Yellow("=== " + "Observación " + numObsString + " ===\n")
 			fmt.Printf("Fecha: %s\n", obs.Fecha_actualizacion)
 			fmt.Printf("Médico: %s\n", obs.Medico)
 			fmt.Printf("Diagnóstico:\n%s\n", obs.Diagnostico)
 			fmt.Printf("Tratamiento:\n%s\n", obs.Tratamiento)
-			ui.Pause("Pulsa [Enter] para continuar...")
+
+			ui.Pause("\nPulsa [Enter] para continuar...")
 
 		case 2:
-			nuevaObs := ui.ReadInput("Ingrese la nueva observación:")
-			nuevoTratamiento := ui.ReadInput("Ingrese el nuevo tratamiento:")
+			nuevaObs := ui.ReadInput("Ingrese la nueva observación")
+			nuevoTratamiento := ui.ReadInput("Ingrese el nuevo tratamiento")
 			data := url.Values{}
 			data.Set("cmd", "modificarExpediente")
 			data.Set("username", c.currentUser)
@@ -902,13 +956,16 @@ func (c *client) gestionarExpediente(expedienteData []byte) {
 			data.Set("tratamiento", nuevoTratamiento)
 			r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 			chk(err)
+			c.log.Printf("Enviando solicitud 'modificarExpediente' al servidor")
+
 			body, err := io.ReadAll(r.Body)
 			chk(err)
 
 			err = json.Unmarshal(body, &resp)
 			chk(err)
 			if resp.Success == 1 {
-				fmt.Println("Observación añadida correctamente")
+				c.log.Println("Observación añadida correctamente")
+				color.Green("Observación añadida correctamente")
 				// Actualizamos los datos locales
 				var updatedExp struct {
 					Observaciones []api.Observaciones `json:"observaciones"`
@@ -917,9 +974,10 @@ func (c *client) gestionarExpediente(expedienteData []byte) {
 					exp.Observaciones = updatedExp.Observaciones
 				}
 			} else {
-				fmt.Println("Error:", resp.Message)
+				c.log.Println("ERROR: La obserservación no ha podido ser añadida")
+				color.Red(resp.Message)
 			}
-			ui.Pause("Pulsa [Enter] para continuar...")
+			ui.Pause("\nPulsa [Enter] para continuar...")
 		}
 	}
 }
