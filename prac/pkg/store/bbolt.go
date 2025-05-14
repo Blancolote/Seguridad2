@@ -148,3 +148,6 @@ func (b *BboltStore) registroID() (uint64, error) {
 	})
 	return id, err
 }
+func (s *BboltStore) Sync() error {
+	return s.db.Sync()
+}

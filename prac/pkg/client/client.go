@@ -14,14 +14,21 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"prac/pkg/api"
 	"prac/pkg/ui"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
+
+	"github.com/mdp/qrterminal"
+	"github.com/nsf/termbox-go"
+	"golang.org/x/term"
 )
 
 var resp struct {
@@ -29,6 +36,8 @@ var resp struct {
 	Message     string   `json:"message"`
 	Token       string   `json:"token"`
 	Expedientes [][]byte `json:"expedientes,omitempty"`
+	Data        string   `json:"data,omitempty"`
+	TokenOTP    string   `json:"tokenOTP,omitempty"`
 }
 
 // client estructura interna no exportada que controla
@@ -41,7 +50,10 @@ type client struct {
 	currentSpecialty string //nuevo
 	currentHospital  string //nuevo
 	currentDNI       string
+	TokenOTP         string
 }
+
+const QR_FOLDER = "temp/qrcodes"
 
 func chk(e error) {
 	if e != nil {
@@ -159,6 +171,7 @@ func (c *client) runLoop() {
 			case 3:
 				c.logoutUser()
 			case 4:
+				c.cleanupQRFolder() // Limpiar carpeta de QR
 				// Opción Salir
 				c.log.Println("Saliendo del cliente...")
 				return
@@ -170,10 +183,194 @@ func (c *client) runLoop() {
 	}
 }
 
+func GenerateComplexPassword(length int) (string, error) {
+	if length < 8 {
+		length = 8 // Mínimo recomendado para seguridad
+	}
+
+	// Definimos los conjuntos de caracteres
+	lowercase := "abcdefghijklmnopqrstuvwxyz"
+	uppercase := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	numbers := "0123456789"
+	symbols := "!@#$%^&*()-_=+[]{}|;:,.<>?"
+
+	// Aseguramos que hay al menos un carácter de cada tipo
+	password := make([]byte, length)
+
+	// Primer carácter minúscula
+	randomIndex, err := rand.Int(rand.Reader, big.NewInt(int64(len(lowercase))))
+	if err != nil {
+		return "", err
+	}
+	password[0] = lowercase[randomIndex.Int64()]
+
+	// Segundo carácter mayúscula
+	randomIndex, err = rand.Int(rand.Reader, big.NewInt(int64(len(uppercase))))
+	if err != nil {
+		return "", err
+	}
+	password[1] = uppercase[randomIndex.Int64()]
+
+	// Tercer carácter número
+	randomIndex, err = rand.Int(rand.Reader, big.NewInt(int64(len(numbers))))
+	if err != nil {
+		return "", err
+	}
+	password[2] = numbers[randomIndex.Int64()]
+
+	// Cuarto carácter símbolo
+	randomIndex, err = rand.Int(rand.Reader, big.NewInt(int64(len(symbols))))
+	if err != nil {
+		return "", err
+	}
+	password[3] = symbols[randomIndex.Int64()]
+
+	// Caracteres restantes aleatorios de todos los conjuntos
+	allChars := lowercase + uppercase + numbers + symbols
+	for i := 4; i < length; i++ {
+		randomIndex, err = rand.Int(rand.Reader, big.NewInt(int64(len(allChars))))
+		if err != nil {
+			return "", err
+		}
+		password[i] = allChars[randomIndex.Int64()]
+	}
+
+	// Mezclamos la contraseña de manera criptográficamente segura
+	// en lugar de usar math/rand.Perm()
+	shuffled := make([]byte, length)
+	copy(shuffled, password)
+
+	// Fisher-Yates shuffle con crypto/rand
+	for i := length - 1; i > 0; i-- {
+		// Genera un índice aleatorio entre 0 e i (inclusive)
+		j, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			return "", err
+		}
+
+		// Intercambia los elementos en las posiciones i y j
+		shuffled[i], shuffled[j.Int64()] = shuffled[j.Int64()], shuffled[i]
+	}
+
+	return string(shuffled), nil
+}
+
+// PasswordStrength evalúa la fortaleza de una contraseña y devuelve una calificación descriptiva
+func PasswordStrength(password string) string {
+	score := 0
+
+	// Longitud
+	if len(password) >= 12 {
+		score += 2
+	} else if len(password) >= 8 {
+		score += 1
+	}
+
+	// Complejidad
+	if strings.ContainsAny(password, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+		score++
+	}
+	if strings.ContainsAny(password, "abcdefghijklmnopqrstuvwxyz") {
+		score++
+	}
+	if strings.ContainsAny(password, "0123456789") {
+		score++
+	}
+	if strings.ContainsAny(password, "!@#$%^&*()-_=+[]{}|;:,.<>?") {
+		score++
+	}
+
+	if score >= 6 {
+		return "Muy fuerte"
+	} else if score >= 4 {
+		return "Fuerte"
+	} else if score >= 3 {
+		return "Media"
+	} else {
+		return "Debil"
+	}
+}
+func ReadPasswordWithLiveStrength() (string, error) {
+	// Al inicio de tu programa
+
+	err := termbox.Init()
+	if err != nil {
+		return "", err
+	}
+	defer termbox.Close()
+
+	var password []byte
+
+	// Función para actualizar la pantalla
+	update := func() {
+		termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+
+		prompt := "Contrasenya:"
+		mask := strings.Repeat("*", len(password))
+		strength := PasswordStrength(string(password))
+
+		// Muestra la línea de contraseña
+		drawString(0, 0, prompt+mask, termbox.ColorWhite, termbox.ColorDefault)
+
+		// Muestra la fortaleza
+		strengthColor := termbox.ColorRed
+		if strength == "Media" {
+			strengthColor = termbox.ColorYellow
+		} else if strength == "Fuerte" {
+			strengthColor = termbox.ColorGreen
+		} else if strength == "Muy fuerte" {
+			strengthColor = termbox.ColorCyan
+		}
+
+		drawString(0, 1, "Fortaleza: "+strength, strengthColor, termbox.ColorDefault)
+
+		// Instrucciones
+		drawString(0, 3, "Presione ENTER para confirmar", termbox.ColorWhite, termbox.ColorDefault)
+
+		termbox.Flush()
+	}
+
+	// Dibuja el estado inicial
+	update()
+
+	// Bucle principal
+	for {
+		ev := termbox.PollEvent()
+		if ev.Type == termbox.EventKey {
+			switch {
+			case ev.Key == termbox.KeyEsc:
+				return "", fmt.Errorf("entrada cancelada")
+			case ev.Key == termbox.KeyEnter:
+				return string(password), nil
+			case ev.Key == termbox.KeyBackspace || ev.Key == termbox.KeyBackspace2:
+				if len(password) > 0 {
+					password = password[:len(password)-1]
+				}
+			case ev.Key == termbox.KeySpace:
+				password = append(password, ' ')
+			case ev.Ch != 0:
+				password = append(password, byte(ev.Ch))
+			}
+
+			update()
+		} else if ev.Type == termbox.EventResize {
+			// Aquí simplemente necesitamos actualizar la pantalla, no necesitamos usar
+			// las nuevas dimensiones directamente
+			update()
+		}
+	}
+}
+
+// Función auxiliar para dibujar texto
+func drawString(x, y int, str string, fg, bg termbox.Attribute) {
+	for i, c := range str {
+		termbox.SetCell(x+i, y, c, fg, bg)
+	}
+}
+
 // registerUser pide credenciales y las envía al servidor para un registro.
 // Si el registro es exitoso, se intenta el login automático.
 func (c *client) registerUser() {
-
 	ui.ClearScreen()
 	fmt.Println("** Registro de usuario **")
 
@@ -190,7 +387,29 @@ func (c *client) registerUser() {
 	chk(err)
 
 	username := ui.ReadInput("Nombre de usuario")
-	password := ui.ReadInput("Contraseña")
+
+	// Generar y sugerir una contraseña segura
+	suggestedPassword, err := GenerateComplexPassword(12)
+	chk(err)
+	fmt.Printf("Contraseña sugerida: %s (Fortaleza: %s)\n",
+		suggestedPassword, PasswordStrength(suggestedPassword))
+	fmt.Println("¿Desea usar esta contraseña? (s/n)")
+
+	var response string
+	fmt.Scanln(&response)
+
+	var password string
+	if strings.ToLower(response) == "s" {
+		password = suggestedPassword
+	} else {
+		// Usar la nueva función interactiva
+		password, err = ReadPasswordWithLiveStrength()
+		chk(err)
+	}
+
+	// Eliminar esta línea que muestra la contraseña en texto claro
+	// fmt.Print(password)
+
 	apellido := ui.ReadInput("Apellido")
 	especialidad := ui.ReadInput("ID de especialidad") //ID?
 	hospital := ui.ReadInput("ID de hospital")
@@ -211,10 +430,31 @@ func (c *client) registerUser() {
 	// comprimimos, ciframos y codificamos la clave privada
 	data.Set("prikey", encode64(encrypt(compress(pkJSON), keyData)))
 
-	r, err := c.httpCliente.PostForm("https://localhost:10443", data) // enviamos por POST
+	r, err := c.httpCliente.PostForm("https://localhost:10443", data)
 	chk(err)
-	io.Copy(os.Stdout, r.Body) // mostramos el cuerpo de la respuesta (es un reader)
 
+	// Decodificar la respuesta JSON en lugar de solo imprimirla
+	var resp api.Response
+	decoder := json.NewDecoder(r.Body)
+	err = decoder.Decode(&resp)
+	chk(err)
+	defer r.Body.Close()
+
+	if resp.Success == 1 {
+		fmt.Println("Registro exitoso.")
+		if otpauth := resp.Data; otpauth != "" {
+			fmt.Printf("Configura TOTP en Google Authenticator usando este URI:\n%s\n", otpauth)
+
+			// Genera y muestra el código QR en la terminal
+			qrterminal.Generate(otpauth, qrterminal.L, os.Stdout)
+
+			fmt.Println("O introduce manualmente el secreto en la app (copiar desde el URI).")
+		} else {
+			fmt.Println("Error: No se recibió un secreto TOTP válido")
+		}
+	} else {
+		fmt.Printf("Error: %s\n", resp.Message)
+	}
 }
 
 // loginUser pide credenciales y realiza un login en el servidor.
@@ -222,8 +462,12 @@ func (c *client) loginUser() {
 	ui.ClearScreen()
 	fmt.Println("** Inicio de sesión **")
 
-	username := ui.ReadInput("Nombre de usuario")
-	password := ui.ReadInput("Contraseña")
+	username := ui.ReadInput("Nombre de usuario:")
+	fmt.Print("Contraseña: ")
+	passwordBytes, err := term.ReadPassword(int(syscall.Stdin))
+	chk(err)
+	fmt.Println() // Añadimos un salto de línea después de introducir la contraseña
+	password := string(passwordBytes)
 
 	keyClient := sha512.Sum512([]byte(password))
 	keyLogin := keyClient[:32] // una mitad para el login (256 bits)
@@ -246,12 +490,35 @@ func (c *client) loginUser() {
 	chk(err)
 
 	if resp.Success == 1 {
-		c.currentUser = username
-		c.authToken = resp.Token
+
+		fmt.Println(resp.Message)
+		code := ui.ReadInput("Introduce tu código TOTP")
+		data := url.Values{}
+		data.Set("cmd", "verifyTOTP")
+		data.Set("username", username)
+		data.Set("code", code)
+
+		r, err := c.httpCliente.PostForm("https://localhost:10443", data)
+		chk(err)
+		body, err := io.ReadAll(r.Body)
+		chk(err)
+
+		err = json.Unmarshal(body, &resp)
+		chk(err)
+
+		if resp.Success != -1 {
+			c.currentUser = username
+			c.authToken = resp.Token
+			c.TokenOTP = resp.TokenOTP
+			fmt.Println("Message: ", resp.Message)
+			return
+		}
+
 	}
 	if resp.Success == -1 {
 		fmt.Println(resp.Message)
 	}
+
 }
 
 func (c *client) verHistorialPaciente() {
@@ -618,6 +885,7 @@ func (c *client) gestionarExpediente(expedienteData []byte) {
 			fmt.Printf("Fecha: %s\n", obs.Fecha_actualizacion)
 			fmt.Printf("Médico: %s\n", obs.Medico)
 			fmt.Printf("Diagnóstico:\n%s\n", obs.Diagnostico)
+			fmt.Printf("Tratamiento:\n%s\n", obs.Tratamiento)
 			ui.Pause("Pulsa [Enter] para continuar...")
 
 		case 2:
@@ -662,4 +930,55 @@ func truncate(text string, length int) string {
 		return text
 	}
 	return text[:length-3] + "..."
+}
+
+// Función para eliminar todos los archivos de la carpeta de QR
+func (c *client) cleanupQRFolder() {
+	// Asegurarse de que la carpeta existe
+	if _, err := os.Stat(QR_FOLDER); os.IsNotExist(err) {
+		c.log.Printf("La carpeta %s no existe, no hay nada que limpiar", QR_FOLDER)
+		return
+	}
+
+	// Abrir la carpeta
+	folder, err := os.Open(QR_FOLDER)
+	if err != nil {
+		c.log.Printf("Error al abrir la carpeta %s: %v", QR_FOLDER, err)
+		return
+	}
+	defer folder.Close()
+
+	// Leer la lista de archivos
+	files, err := folder.Readdirnames(-1)
+	if err != nil {
+		c.log.Printf("Error al leer el contenido de la carpeta %s: %v", QR_FOLDER, err)
+		return
+	}
+
+	// Eliminar cada archivo
+	for _, file := range files {
+		filePath := filepath.Join(QR_FOLDER, file)
+
+		// No eliminar directorios (solo por seguridad)
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			c.log.Printf("Error al verificar archivo %s: %v", filePath, err)
+			continue
+		}
+
+		// Si es directorio, saltar
+		if fileInfo.IsDir() {
+			continue
+		}
+
+		// Eliminar el archivo
+		err = os.Remove(filePath)
+		if err != nil {
+			c.log.Printf("Error al eliminar archivo %s: %v", filePath, err)
+		} else {
+			c.log.Printf("Archivo eliminado: %s", filePath)
+		}
+	}
+
+	c.log.Printf("Limpieza de la carpeta %s completada", QR_FOLDER)
 }

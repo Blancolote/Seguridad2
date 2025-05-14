@@ -14,11 +14,10 @@ package main
 import (
 	"log"
 	"os"
-	"time"
-
 	"prac/pkg/client"
 	"prac/pkg/server"
 	"prac/pkg/ui"
+	"time"
 )
 
 func main() {

@@ -71,4 +71,5 @@ type Response struct {
 	Data        string   `json:"data,omitempty"`
 	Expedientes [][]byte `json:"expedientes,omitempty"` //lista con el id de los pacientes que tienen algún historial con su médico
 	Hospital    int      `json:"hospital,omitempty"`
+	TokenOTP    string   `json:"tokenOTP, omitempty`
 }
